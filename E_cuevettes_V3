@@ -1,0 +1,1112 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import sys
+import tkinter as tk
+import numpy as np
+from scipy.signal import find_peaks
+from tkinter import filedialog, messagebox, ttk
+from matplotlib.ticker import MultipleLocator
+
+
+# ==========================================
+# 1. INTERAKTIVE EINGABEN & IMPORT
+# ==========================================
+root = tk.Tk()
+root.withdraw()
+
+print("Please select the photometer file...")
+datei_photometer = filedialog.askopenfilename(
+    title="Select Photometer File", 
+    filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+)
+if not datei_photometer:
+    print("No photometer file selected. Aborting.")
+    sys.exit()
+
+reiner_dateiname = os.path.basename(datei_photometer)
+if "_" in reiner_dateiname:
+    datei_datum = reiner_dateiname.split("_")[0] + "_"
+else:
+    datei_datum = os.path.splitext(reiner_dateiname)[0] + "_"
+
+print("Please select the chrono file...")
+datei_chrono = filedialog.askopenfilename(
+    title="Select Chrono File", 
+    filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+)
+
+# Neue Dateiabfragen für DPV und CV
+print("Please select the DPV PRE run file (or cancel to skip)...")
+datei_dpv_pre = filedialog.askopenfilename(title="Select DPV PRE File", filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+
+print("Please select the DPV POST run file (or cancel to skip)...")
+datei_dpv_post = filedialog.askopenfilename(title="Select DPV POST File", filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+
+print("Please select the CV PRE run file (or cancel to skip)...")
+datei_cv_pre = filedialog.askopenfilename(title="Select CV PRE File", filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+
+print("Please select the CV POST run file (or cancel to skip)...")
+datei_cv_post = filedialog.askopenfilename(title="Select CV POST File", filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+
+
+def parse_eingabe(eingabe_str):
+    if not eingabe_str:
+        return []
+    teile = str(eingabe_str).replace(';', ',').replace(' ', '').split(',')
+    indizes = []
+    for t in teile:
+        if t.isdigit():
+            val = int(t)
+            if 1 <= val <= 8:
+                indizes.append(val - 1)
+    return indizes
+
+def parse_abgebrochen(eingabe_str):
+    if not eingabe_str:
+        return {}
+    teile = str(eingabe_str).replace(';', ',').replace(' ', '').split(',')
+    abgebrochen_dict = {}
+    for t in teile:
+        if ':' in t:
+            try:
+                k_str, m_str = t.split(':')
+                val = int(k_str.strip())
+                min_val = float(m_str.strip())
+                if 1 <= val <= 8:
+                    abgebrochen_dict[val - 1] = min_val
+            except ValueError:
+                pass
+    return abgebrochen_dict
+
+# ==========================================
+# KONSOLIDIERTE USER INTERFACE (UI) WINDOW
+# ==========================================
+config_window = tk.Toplevel(root)
+config_window.title("Analyse-Konfiguration & Parameter")
+config_window.geometry("1150x750")
+
+padx_val = 15
+pady_val = 5
+
+anzahl_kanale = 8
+kontrollen_definitionen = ["-P, +C, +M", "+P, +C, -M", "+P, -C, +M"]
+
+# Option: Baseline Subtraktion
+baseline_var = tk.BooleanVar(master=config_window, value=False)
+chk_baseline = tk.Checkbutton(config_window, text="Baseline-Subtraktion aktivieren (Nullpunktabgleich)", variable=baseline_var, font=('Arial', 10, 'bold'))
+chk_baseline.grid(row=0, column=0, columnspan=4, sticky="w", padx=padx_val, pady=10)
+
+var_mode_raw = tk.BooleanVar(master=config_window, value=True)
+var_mode_lin = tk.BooleanVar(master=config_window, value=False)
+var_mode_dyn = tk.BooleanVar(master=config_window, value=True)
+var_mode_norm = tk.BooleanVar(master=config_window, value=True)
+
+frame_modes = tk.Frame(config_window)
+frame_modes.grid(row=0, column=4, columnspan=5, sticky="w", padx=padx_val, pady=10)
+tk.Label(frame_modes, text="OD420 Varianten:", font=('Arial', 10, 'bold')).pack(side="left", padx=(0, 5))
+
+tk.Checkbutton(frame_modes, text="Raw", variable=var_mode_raw).pack(side="left")
+
+tk.Checkbutton(frame_modes, text="Statisch Linear", variable=var_mode_lin).pack(side="left")
+# NEU: Eingabefeld für den statischen Faktor
+ent_factor = tk.Entry(frame_modes, width=5)
+ent_factor.insert(0, "1.5")
+ent_factor.pack(side="left", padx=(0, 10))
+
+tk.Checkbutton(frame_modes, text="Dyn. Linear", variable=var_mode_dyn).pack(side="left")
+tk.Checkbutton(frame_modes, text="Norm (420/600)", variable=var_mode_norm).pack(side="left")
+tk.Label(config_window, text="Kanal-Konfiguration (Spalten = Kanäle 1-8):", font=('Arial', 10, 'bold')).grid(row=1, column=0, columnspan=9, sticky="w", padx=padx_val, pady=(10, 2))
+
+grid_frame = tk.Frame(config_window, relief="groove", bd=2)
+grid_frame.grid(row=2, column=0, columnspan=9, sticky="w", padx=padx_val, pady=5)
+
+# Datentypen für die Zeilen "Daten fehlt"
+daten_typen = ["Photometer", "Chronoamperometry", "DPV prerun", "DPV postrun", "CV prerun", "CV postrun"]
+
+# Dropdown-Optionen: Keine Kontrolle oder eine der 3 Kontrollen
+control_options = ["(sample)"] + [f"Ctrl {n+1}: {kontrollen_definitionen[n]}" for n in range(len(kontrollen_definitionen))]
+
+# Standardwerte für Kontrollen (alter Default: Kanal 3, 5, 8)
+standard_kontroll_kanale = {3: 0, 5: 1, 8: 2}  # Kanal-Nummer (1-basiert) -> Kontroll-Index
+
+# Speicher für die Widgets/Variablen
+grid_control_vars = []      # StringVar pro Kanal (Dropdown)
+grid_exclude_vars = []      # BooleanVar pro Kanal (Ausblenden)
+grid_missing_vars = []      # dict: datentyp -> BooleanVar pro Kanal
+
+# Kopfzeile: Kanal-Nummern
+tk.Label(grid_frame, text="", width=18).grid(row=0, column=0, padx=3, pady=3)
+for ch in range(anzahl_kanale):
+    tk.Label(grid_frame, text=f"CH{ch+1}", font=('Arial', 9, 'bold'), width=10).grid(row=0, column=1+ch, padx=3, pady=3)
+
+# Zeile 1: Kontroll-Zuweisung (Dropdown)
+tk.Label(grid_frame, text="Kontrolle:", font=('Arial', 9, 'bold'), anchor="w", width=18).grid(row=1, column=0, sticky="w", padx=3, pady=3)
+
+# Callback: Wenn "Control 1 (ohne Strom)" gewählt wird, Chrono-"missing" per Default aktivieren
+def make_control_callback(ch):
+    def _callback(*args):
+        sel = grid_control_vars[ch].get()
+        # Control 1 entspricht dem ersten Eintrag der Definitionen ("-P, +C, +M" = ohne Potential)
+        if sel == control_options[1]:
+            grid_missing_vars[ch]["Chronoamperometry"].set(True)
+        else:
+            # Beim Wechsel weg von Control 1 den Auto-Haken wieder entfernen
+            grid_missing_vars[ch]["Chronoamperometry"].set(False)
+    return _callback
+
+for ch in range(anzahl_kanale):
+    var = tk.StringVar(master=config_window)
+    default_val = control_options[0]
+    if (ch + 1) in standard_kontroll_kanale:
+        default_val = control_options[1 + standard_kontroll_kanale[ch + 1]]
+    var.set(default_val)
+    om = tk.OptionMenu(grid_frame, var, *control_options)
+    om.config(width=12)
+    om.grid(row=1, column=1+ch, padx=3, pady=3)
+    var.trace_add("write", make_control_callback(ch))
+    grid_control_vars.append(var)
+
+# Zeile 2: Kanal ausblenden (Checkbox)
+tk.Label(grid_frame, text="Ausblenden:", font=('Arial', 9, 'bold'), anchor="w", width=18).grid(row=2, column=0, sticky="w", padx=3, pady=3)
+for ch in range(anzahl_kanale):
+    var = tk.BooleanVar(master=config_window, value=(ch == 3))  # alter Default: Kanal 4
+    chk = tk.Checkbutton(grid_frame, variable=var)
+    chk.grid(row=2, column=1+ch, padx=3, pady=3)
+    grid_exclude_vars.append(var)
+
+# Zeilen 3-8: "Daten fehlt" pro Datentyp
+for ch in range(anzahl_kanale):
+    grid_missing_vars.append({})
+
+for dt_idx, dt_name in enumerate(daten_typen):
+    tk.Label(grid_frame, text=f"{dt_name} fehlt:", font=('Arial', 9), anchor="w", width=18).grid(row=3+dt_idx, column=0, sticky="w", padx=3, pady=3)
+    for ch in range(anzahl_kanale):
+        var = tk.BooleanVar(master=config_window, value=False)
+        chk = tk.Checkbutton(grid_frame, variable=var)
+        chk.grid(row=3+dt_idx, column=1+ch, padx=3, pady=3)
+        grid_missing_vars[ch][dt_name] = var
+
+# Standard: Kanal 3 (Control 1) -> Chrono fehlt initial setzen (Callback triggern)
+for ch in range(anzahl_kanale):
+    make_control_callback(ch)()
+
+# ==========================================
+# Weitere Parameter (unterhalb des Grids)
+# ==========================================
+tk.Label(config_window, text="Abgebrochene Kanäle (Kanal:Stunde, z.B. 1:2.5):", font=('Arial', 9, 'bold')).grid(row=3, column=0, sticky="w", padx=padx_val, pady=(15,2))
+entry_abgebrochen = tk.Entry(config_window, width=20)
+entry_abgebrochen.grid(row=3, column=1, sticky="w", padx=padx_val, pady=(15,2))
+
+tk.Label(config_window, text="Defekte Chrono-Kanäle im Plot ignorieren (z.B. 3):", font=('Arial', 9, 'bold'), fg="darkred").grid(row=4, column=0, sticky="w", padx=padx_val, pady=(5,2))
+entry_broken_chrono = tk.Entry(config_window, width=20)
+entry_broken_chrono.grid(row=4, column=1, sticky="w", padx=padx_val, pady=(5,2))
+
+# DPV X-Achsen Bereich
+tk.Label(config_window, text="DPV X-Achsen Bereich (Min, Max in V):", font=('Arial', 9, 'bold')).grid(row=5, column=0, sticky="w", padx=padx_val, pady=(10,2))
+
+frame_dpv = tk.Frame(config_window)
+frame_dpv.grid(row=5, column=1, sticky="w", padx=padx_val, pady=(10,2))
+
+entry_dpv_min = tk.Entry(frame_dpv, width=8)
+entry_dpv_min.insert(0, "-0.6")
+entry_dpv_min.pack(side=tk.LEFT, padx=(0, 5))
+
+tk.Label(frame_dpv, text="bis").pack(side=tk.LEFT)
+
+entry_dpv_max = tk.Entry(frame_dpv, width=8)
+entry_dpv_max.insert(0, "0.6") 
+entry_dpv_max.pack(side=tk.LEFT, padx=(5, 0))
+
+# Eingabefeld für den Proben-Namen
+tk.Label(config_window, text="Name der Probe (für Legende/Ordner):", font=('Arial', 9, 'bold')).grid(row=6, column=0, sticky="w", padx=padx_val, pady=(10,2))
+entry_sample_name = tk.Entry(config_window, width=40)
+entry_sample_name.insert(0, r"$\mathit{V. natriegens}$ $\Delta\mathit{dns}$")
+entry_sample_name.grid(row=6, column=1, sticky="w", padx=padx_val, pady=(10,2))
+
+gui_data = {}
+
+# Checkbox für 20h Cutoff
+cutoff_20h_var = tk.BooleanVar(master=config_window, value=True)
+chk_cutoff_20h = tk.Checkbutton(config_window, text="Alle Zeitachsen bei exakt 20h abbrechen", variable=cutoff_20h_var, font=('Arial', 9, 'bold'))
+chk_cutoff_20h.grid(row=7, column=0, columnspan=2, sticky="w", padx=padx_val, pady=(10,2))
+
+def on_confirm():
+    try:
+        gui_data['activate_baseline'] = baseline_var.get()
+
+        # Kontroll-Zuweisung aus Dropdowns auslesen
+        kontroll_zuweisung = {n: None for n in range(len(kontrollen_definitionen))}
+        for ch in range(anzahl_kanale):
+            sel = grid_control_vars[ch].get()
+            for n in range(len(kontrollen_definitionen)):
+                if sel == control_options[1 + n]:
+                    if kontroll_zuweisung[n] is not None:
+                        raise ValueError(f"Kontrolle {n+1} wurde mehreren Kanälen zugewiesen.")
+                    kontroll_zuweisung[n] = ch + 1  
+        gui_data['kontroll_zuweisung'] = kontroll_zuweisung
+
+        # Ausblenden
+        gui_data['ausblenden_idx'] = [ch for ch in range(anzahl_kanale) if grid_exclude_vars[ch].get()]
+
+        # Fehlende Daten
+        missing = {dt: [] for dt in daten_typen}
+        for ch in range(anzahl_kanale):
+            for dt in daten_typen:
+                if grid_missing_vars[ch][dt].get():
+                    missing[dt].append(ch)
+        gui_data['missing'] = missing
+
+        gui_data['abgebrochen'] = entry_abgebrochen.get()
+        # NEU: Den Text aus dem Feld auslesen
+        gui_data['broken_chrono'] = entry_broken_chrono.get()
+
+        gui_data['abgebrochen'] = entry_abgebrochen.get()
+        gui_data['dpv_min'] = float(entry_dpv_min.get())
+        gui_data['dpv_max'] = float(entry_dpv_max.get())
+        gui_data['sample_name'] = entry_sample_name.get()
+        gui_data['cutoff_20h'] = cutoff_20h_var.get()
+        gui_data['activate_baseline'] = baseline_var.get()
+        modes = []
+        if var_mode_raw.get(): modes.append('raw')
+        if var_mode_lin.get(): modes.append('linear')
+        if var_mode_dyn.get(): modes.append('dyn_lin')
+        if var_mode_norm.get(): modes.append('norm')
+        if not modes:
+            raise ValueError("Bitte mindestens eine OD420 Variante auswählen!")
+        gui_data['od420_modes'] = modes
+        
+        try:
+            gui_data['custom_factor'] = float(ent_factor.get().replace(',', '.'))
+        except ValueError:
+            raise ValueError("Bitte einen gültigen numerischen Faktor für 'Statisch Linear' eingeben (z.B. 1.5).")
+        
+        config_window.destroy()
+    except ValueError as ve:
+        messagebox.showerror("Eingabefehler", str(ve))
+    except Exception:
+        messagebox.showerror("Eingabefehler", "Bitte stelle sicher, dass alle Werte gültig sind.")
+
+btn_confirm = tk.Button(config_window, text="Konfiguration bestätigen & Analyse starten", command=on_confirm, bg="#198754", fg="white", font=('Arial', 10, 'bold'))
+btn_confirm.grid(row=7, column=0, columnspan=2, pady=(30, 20))
+
+root.wait_window(config_window)
+
+if not gui_data:
+    print("Analysis canceled by user.")
+    sys.exit()
+
+# Zuweisung der UI Parameter
+activate_baseline = gui_data['activate_baseline']
+dpv_min_val = gui_data['dpv_min']
+dpv_max_val = gui_data['dpv_max']
+cutoff_20h_active = gui_data['cutoff_20h']
+
+# Kontroll-Indizes (0-basiert) aus der Zuweisung; None wenn nicht vergeben
+kontroll_zuweisung = gui_data['kontroll_zuweisung']  # {0: ch_num_or_None, 1:..., 2:...}
+kontrollen_idx = []
+kontrollen_namen_mapping = {}
+kontroll_nummer_map = {}
+for n in range(len(kontrollen_definitionen)):
+    ch_num = kontroll_zuweisung[n]
+    if ch_num is not None:
+        ch_idx = ch_num - 1
+        kontrollen_idx.append(ch_idx)
+        kontrollen_namen_mapping[ch_idx] = kontrollen_definitionen[n]
+        kontroll_nummer_map[ch_idx] = n + 1
+
+kanale_ausblenden = gui_data['ausblenden_idx']
+kanale_abgebrochen = parse_abgebrochen(gui_data['abgebrochen'])
+
+# Fehlende Daten
+missing_data = gui_data['missing']
+photo_ausblenden = missing_data["Photometer"]  # Kanäle ohne Photometer-Daten
+
+farben_kontrollen_liste = ['red', 'purple', 'blue', 'cyan', 'magenta']
+kontroll_farben_map = {ch_idx: farben_kontrollen_liste[(kontroll_nummer_map[ch_idx]-1) % len(farben_kontrollen_liste)] for ch_idx in kontrollen_idx}
+
+replikate_idx = [i for i in range(anzahl_kanale) if i not in kontrollen_idx and i not in kanale_ausblenden]
+
+kanal_namen = {}
+for i in range(anzahl_kanale):
+    if i in kontrollen_idx:
+        kanal_namen[i] = f"Control {kontroll_nummer_map[i]}: {kontrollen_namen_mapping[i]}"
+    elif i in kanale_ausblenden:
+        kanal_namen[i] = f"Channel {i+1} (Hidden)"
+    elif i in kanale_abgebrochen:
+        kanal_namen[i] = f"Channel {i+1} (Aborted Early)"
+    else:
+        kanal_namen[i] = f"Channel {i+1} (Sample)"
+
+# Sample Name zuweisen und Ordnerstruktur bauen
+sample_name = gui_data.get('sample_name', 'Sample')
+sicherer_sample_name = sample_name.replace(":", "_").replace(", ", "_").replace(" ", "_").replace("$", "").replace("\\", "").replace("{", "").replace("}", "")
+
+# Ordnerstruktur: Results_Plots/Datum_Probenname
+output_ordner = os.path.join("Results_Plots", f"{datei_datum}{sicherer_sample_name}")
+os.makedirs(output_ordner, exist_ok=True) 
+
+flaeche_cm2 = 0.125
+streulicht_faktor = gui_data.get('custom_factor', 1.5) 
+glaettung_fenster = 21
+
+
+# Hilfsfunktion zum Laden elektrochemischer Dateien
+def load_ec_file(filepath):
+    if not filepath:
+        return None
+    try:
+        return pd.read_csv(filepath, sep=',', skiprows=6, header=None, encoding='utf-16')
+    except Exception as e:
+        print(f"Warning: Could not read {os.path.basename(filepath)} - {e}")
+        return None
+
+try:
+    daten_chrono = load_ec_file(datei_chrono) if datei_chrono else None
+    daten_photometer = pd.read_csv(datei_photometer, sep=',', skiprows=2, header=None)
+    
+    daten_dpv_pre = load_ec_file(datei_dpv_pre)
+    daten_dpv_post = load_ec_file(datei_dpv_post)
+    daten_cv_pre = load_ec_file(datei_cv_pre)
+    daten_cv_post = load_ec_file(datei_cv_post)
+except Exception as e:
+    print(f"Error reading core files: {e}")
+    sys.exit()
+
+# ==========================================
+# 2. DIE MAPPINGS 
+# ==========================================
+# Für einen gegebenen Datensatz-Typ werden nur die Kanäle berücksichtigt, 
+# die tatsächlich Daten haben (also nicht in 'missing_channels' stehen).
+# Reihenfolge: Kanal 1..8, überspringe fehlende -> laufender Spalten-Index.
+def build_mapping(missing_channels):
+    mapping = {}
+    counter = 0
+    for i in range(anzahl_kanale):
+        if i in missing_channels:
+            mapping[i] = None
+        else:
+            mapping[i] = counter
+            counter += 1
+    return mapping
+
+# Chrono-Mapping basiert auf fehlenden Chrono-Daten (inkl. Control ohne Strom)
+chrono_mapping = build_mapping(missing_data["Chronoamperometry"])
+# NEU: Defekte Chrono-Kanäle aus dem Plot nehmen, OHNE das Spalten-Mapping zu verschieben
+kaputte_chrono_kanale = parse_eingabe(gui_data.get('broken_chrono', ''))
+for ch_idx in kaputte_chrono_kanale:
+    if ch_idx in chrono_mapping:
+        chrono_mapping[ch_idx] = None
+
+# Separate Mappings für DPV/CV Pre/Post
+dpv_pre_mapping = build_mapping(missing_data["DPV prerun"])
+dpv_post_mapping = build_mapping(missing_data["DPV postrun"])
+cv_pre_mapping = build_mapping(missing_data["CV prerun"])
+cv_post_mapping = build_mapping(missing_data["CV postrun"])
+
+# Kanal ohne Strom (nur für Info / evtl. Rückwärtskompatibilität)
+kanal_ohne_strom = None
+for idx, name in kontrollen_namen_mapping.items():
+    if "-P, +C, +M" == name:
+        kanal_ohne_strom = idx
+        break
+
+header_zeile = pd.read_csv(datei_photometer, nrows=1, header=None).iloc[0]
+photo_spalten_suche = {}
+
+for col_idx, zellen_wert in enumerate(header_zeile):
+    if pd.notna(zellen_wert) and isinstance(zellen_wert, str) and "CH" in zellen_wert:
+        kanal_name = zellen_wert.strip()
+        photo_spalten_suche[kanal_name] = col_idx
+
+photo_mapping_cols = {}
+for i in range(anzahl_kanale):
+    ch_str_420 = f"CH{i+1}_420"
+    ch_str_600 = f"CH{i+1}_600"
+    
+    photo_mapping_cols[i] = {
+        't_420': photo_spalten_suche.get(ch_str_420),
+        'a_420': photo_spalten_suche.get(ch_str_420) + 1 if ch_str_420 in photo_spalten_suche else None,
+        't_600': photo_spalten_suche.get(ch_str_600),
+        'a_600': photo_spalten_suche.get(ch_str_600) + 1 if ch_str_600 in photo_spalten_suche else None
+    }
+# NEU: Photometer-Daten für spezifische Kanäle komplett ignorieren
+for i in photo_ausblenden:
+    if i in photo_mapping_cols:
+        photo_mapping_cols[i] = {
+            't_420': None, 'a_420': None,
+            't_600': None, 'a_600': None
+        }
+# --- NEU: Globaler 20h Cutoff ---
+if cutoff_20h_active:
+    # 1. Chrono-Daten kappen (Zeitstempel in der CSV sind Sekunden -> 20h * 3600s = 72000s)
+    if daten_chrono is not None:
+        for i in range(anzahl_kanale):
+            c_idx = chrono_mapping.get(i)
+            if c_idx is not None:
+                col_zeit = c_idx * 2
+                col_strom = c_idx * 2 + 1
+                if col_strom in daten_chrono.columns:
+                    mask_c = pd.to_numeric(daten_chrono[col_zeit], errors='coerce') > (20 * 3600)
+                    daten_chrono.loc[mask_c, col_strom] = float('nan')
+    
+    # 2. Photometer-Daten kappen (Zeitstempel in der CSV sind Minuten -> 20h * 60m = 1200m)
+    if daten_photometer is not None:
+        for i in range(anzahl_kanale):
+            cols = photo_mapping_cols[i]
+            # OD600
+            if cols['t_600'] is not None and cols['a_600'] in daten_photometer.columns:
+                mask_600 = pd.to_numeric(daten_photometer[cols['t_600']], errors='coerce') > (20 * 60)
+                daten_photometer.loc[mask_600, cols['a_600']] = float('nan')
+            # OD420
+            if cols['t_420'] is not None and cols['a_420'] in daten_photometer.columns:
+                mask_420 = pd.to_numeric(daten_photometer[cols['t_420']], errors='coerce') > (20 * 60)
+                daten_photometer.loc[mask_420, cols['a_420']] = float('nan')
+
+# ==========================================
+# 2.5 DYNAMISCHER STREULICHTFAKTOR
+# ==========================================
+use_dynamic_sl = False
+poly_coeffs = None
+
+# Kontrolle 2 ist an Index 1 in den Dropdown-Definitionen ("+P, +C, -M")
+ctrl2_ch_num = gui_data.get('kontroll_zuweisung', {}).get(1)
+
+if ctrl2_ch_num is not None and daten_photometer is not None:
+    ctrl2_idx = ctrl2_ch_num - 1 # 0-basiert
+    cols_c2 = photo_mapping_cols.get(ctrl2_idx)
+    
+    if cols_c2 and cols_c2['a_600'] is not None and cols_c2['a_420'] is not None:
+        od600_c2 = pd.to_numeric(daten_photometer[cols_c2['a_600']], errors='coerce')
+        od420_c2 = pd.to_numeric(daten_photometer[cols_c2['a_420']], errors='coerce')
+        
+        # NaNs und extrem kleine OD-Werte filtern (verhindert Division durch Null)
+        valid_mask = od600_c2.notna() & od420_c2.notna() & (od600_c2 > 0.05)
+        
+        if valid_mask.any():
+            od600_clean = od600_c2[valid_mask]
+            od420_clean = od420_c2[valid_mask]
+            
+            # Dynamisch Linear (Polynom 1. Grades): OD420_störung = m * OD600 + b
+            poly_coeffs = np.polyfit(od600_clean, od420_clean, 1)
+            use_dynamic_sl = True
+            print(f"Dynamischer Streulichtfaktor (Linear) aktiv. Steigung und Offset: {poly_coeffs}")
+        else:
+            print("Zu wenig gültige Daten in Kontrolle 2. Nutze statischen Fallback.")
+
+def get_od420_corrected(od420_raw, od600_series, mode):
+    """Berechnet die gewählte OD420 Variante."""
+    if mode == 'raw':
+        return od420_raw
+    elif mode == 'norm':
+        # Verhindere Division durch 0
+        safe_od600 = od600_series.replace(0, np.nan)
+        ratio = od420_raw / safe_od600
+        # Ersten Messpunkt (Index 0) auf NaN setzen, damit er ignoriert wird
+        if len(ratio) > 0:
+            ratio.iloc[0] = np.nan
+        return ratio
+    elif mode == 'dyn_lin' and use_dynamic_sl:
+        return od420_raw - np.polyval(poly_coeffs, od600_series)
+    else:
+        # Fallback (statisch linear, angewendet für 'linear' oder fehlendes 'dyn_lin')
+        return od420_raw - (streulicht_faktor * od600_series)
+
+def get_od420_ylabel(mode):
+    if mode == 'raw': return r'FeCN' + '\n' + r'(OD$_{420}$ Raw)'
+    if mode == 'norm': return r'OD$_{420}$ / OD$_{600}$'
+    if mode == 'dyn_lin': return r'FeCN' + '\n' + r'(OD$_{420}$ Dyn. Linear)'
+    # Schreibt den individuellen Faktor direkt in den Graphen
+    return r'FeCN' + '\n' + f'(OD$_{{420}}$ Statisch {streulicht_faktor})'
+# ==========================================
+# 3. DIE GROSSEN ÜBERSICHTS-GRAPHEN (Chrono + OD)
+# ==========================================
+if daten_chrono is not None:
+    fig_chrono = plt.figure('Overview: Chronoamperometry', figsize=(10, 5))
+fig_600 = plt.figure('Overview: OD 600 nm', figsize=(10, 5))
+
+figs_420 = {}
+for mode in gui_data['od420_modes']:
+    figs_420[mode] = plt.figure(f'Overview: OD 420 nm ({mode})', figsize=(10, 5))
+
+for i in range(anzahl_kanale):
+    if i in kanale_ausblenden:
+        continue
+        
+    name_fuer_legende = kanal_namen.get(i, f"Channel {i+1}")
+    
+    # Chrono
+    if daten_chrono is not None:
+        chrono_idx = chrono_mapping.get(i)
+        if chrono_idx is not None and i != kanal_ohne_strom:
+            col_zeit_c = chrono_idx * 2        
+            col_strom_c = chrono_idx * 2 + 1    
+            if col_strom_c in daten_chrono.columns:
+                zeit_chrono = pd.to_numeric(daten_chrono[col_zeit_c], errors='coerce') / 3600
+                strom_raw = pd.to_numeric(daten_chrono[col_strom_c], errors='coerce').copy()
+                if i in kanale_abgebrochen:
+                    cutoff_h = kanale_abgebrochen[i]
+                    strom_raw.loc[zeit_chrono > cutoff_h] = float('nan')
+                if activate_baseline and not strom_raw.dropna().empty:
+                    baseline = strom_raw.dropna().iloc[:5].mean() if len(strom_raw.dropna()) >= 5 else strom_raw.dropna().iloc[0]
+                    strom_raw = strom_raw - baseline
+                stromdichte = strom_raw / flaeche_cm2
+                plt.figure(fig_chrono.number) 
+                plt.plot(zeit_chrono, stromdichte, linewidth=2, label=name_fuer_legende)
+
+    # Photo
+    cols = photo_mapping_cols[i]
+    abs_600_daten = pd.Series(dtype=float) 
+    
+    if cols['t_600'] is not None and cols['a_600'] in daten_photometer.columns:
+        zeit_600 = pd.to_numeric(daten_photometer[cols['t_600']], errors='coerce') / 60
+        abs_600_daten = pd.to_numeric(daten_photometer[cols['a_600']], errors='coerce')
+        plt.figure(fig_600.number) 
+        plt.plot(zeit_600, abs_600_daten, linewidth=2, label=name_fuer_legende)
+
+    if cols['t_420'] is not None and cols['a_420'] in daten_photometer.columns:
+        zeit_420 = pd.to_numeric(daten_photometer[cols['t_420']], errors='coerce') / 60
+        abs_420_raw = pd.to_numeric(daten_photometer[cols['a_420']], errors='coerce')
+        if not abs_600_daten.empty:
+            for mode in gui_data['od420_modes']:
+                abs_420_korrigiert = get_od420_corrected(abs_420_raw, abs_600_daten, mode)
+                plt.figure(figs_420[mode].number) 
+                plt.plot(zeit_420, abs_420_korrigiert, linewidth=2, label=name_fuer_legende)
+
+figs_to_save = [fig_600]
+titles = [r'Optical Density (OD$_{600}$)']
+ylabels = ['Absorbance (OD)']
+xlabels = ['Time [h]']
+fnames = ['Overview_OD600.png']
+
+if daten_chrono is not None:
+    figs_to_save.insert(0, fig_chrono)
+    titles.insert(0, 'Chronoamperometry' + (' (Baseline Subtracted)' if activate_baseline else ''))
+    ylabels.insert(0, 'Current Density (µA/cm²)')
+    xlabels.insert(0, 'Time [h]')
+    fnames.insert(0, 'Overview_Chrono.png')
+
+for mode in gui_data['od420_modes']:
+    figs_to_save.append(figs_420[mode])
+    titles.append('OD420 / OD600' if mode == 'norm' else f'FeCN ({mode})')
+    ylabels.append('Ratio (OD420/OD600)' if mode == 'norm' else 'Absorbance (OD)')
+    xlabels.append('Time [h]')
+    fnames.append(f'Overview_OD420_{mode}.png')
+
+for fig, title, ylabel, xlabel, dateiname in zip(figs_to_save, titles, ylabels, xlabels, fnames):
+    plt.figure(fig.number)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(title="Legend", loc='best')
+    plt.gca().xaxis.set_major_locator(MultipleLocator(4))
+    plt.gca().xaxis.set_minor_locator(MultipleLocator(1))
+    plt.tight_layout()
+    pfad = os.path.join(output_ordner, f"{datei_datum}{dateiname}")
+    plt.savefig(pfad, dpi=600, bbox_inches='tight')
+
+# ==========================================
+# 4. DIE KOMBI-GRAPHEN (PRO PROBE)
+# ==========================================
+for mode in gui_data['od420_modes']:
+    for i in range(anzahl_kanale):
+        if i in kanale_ausblenden:
+            continue
+        
+        name = kanal_namen.get(i, f"Channel {i+1}")
+        fig_kombi, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+
+        chrono_idx = chrono_mapping.get(i)
+        if daten_chrono is not None and chrono_idx is not None and (chrono_idx * 2 + 1) in daten_chrono.columns and i != kanal_ohne_strom:
+            col_zeit_c = chrono_idx * 2
+            col_strom_c = chrono_idx * 2 + 1
+            zeit_chrono = pd.to_numeric(daten_chrono[col_zeit_c], errors='coerce') / 3600
+            strom_raw = pd.to_numeric(daten_chrono[col_strom_c], errors='coerce').copy()
+            if i in kanale_abgebrochen:
+                cutoff_h = kanale_abgebrochen[i]
+                strom_raw.loc[zeit_chrono > cutoff_h] = float('nan')
+            if activate_baseline and not strom_raw.dropna().empty:
+                baseline = strom_raw.dropna().iloc[:5].mean() if len(strom_raw.dropna()) >= 5 else strom_raw.dropna().iloc[0]
+                strom_raw = strom_raw - baseline
+            stromdichte = strom_raw / flaeche_cm2
+            ax1.plot(zeit_chrono, stromdichte, color='blue', linewidth=2)
+        else:
+            ax1.text(0.5, 0.5, 'No Chrono Data Available', 
+                     horizontalalignment='center', verticalalignment='center', 
+                     transform=ax1.transAxes, color='grey', fontstyle='italic')
+
+        ax1.set_ylabel('Current Density\n(µA/cm²)', fontsize=11)
+        ax1.grid(True, linestyle=':', alpha=0.4)
+
+        cols = photo_mapping_cols[i]
+        abs_600_daten = pd.Series(dtype=float)
+
+        if cols['t_600'] is not None and cols['a_600'] in daten_photometer.columns:
+            zeit_600 = pd.to_numeric(daten_photometer[cols['t_600']], errors='coerce') / 60
+            abs_600_daten = pd.to_numeric(daten_photometer[cols['a_600']], errors='coerce')
+            ax2.plot(zeit_600, abs_600_daten, color='green', linewidth=2)
+        ax2.set_ylabel(r'Optical Density' + '\n' + r'(OD$_{600}$)', fontsize=11)
+        ax2.grid(True, linestyle=':', alpha=0.4)
+
+        if cols['t_420'] is not None and cols['a_420'] in daten_photometer.columns:
+            zeit_420 = pd.to_numeric(daten_photometer[cols['t_420']], errors='coerce') / 60
+            abs_420_raw = pd.to_numeric(daten_photometer[cols['a_420']], errors='coerce')
+            if not abs_600_daten.empty:
+                abs_420_korrigiert = get_od420_corrected(abs_420_raw, abs_600_daten, mode)
+                ax3.plot(zeit_420, abs_420_korrigiert, color='orange', linewidth=2)
+                
+        ax3.set_ylabel(get_od420_ylabel(mode), fontsize=11)
+        ax3.set_xlabel('Time [h]', fontsize=12)
+        ax3.grid(True, linestyle=':', alpha=0.4)
+        ax3.xaxis.set_major_locator(MultipleLocator(4))
+        ax3.xaxis.set_minor_locator(MultipleLocator(1))
+
+        ax1.text(-0.12, 1.05, 'A', transform=ax1.transAxes, fontsize=14, fontweight='bold')
+        ax2.text(-0.12, 1.05, 'B', transform=ax2.transAxes, fontsize=14, fontweight='bold')
+        ax3.text(-0.12, 1.05, 'C', transform=ax3.transAxes, fontsize=14, fontweight='bold')
+
+        plt.tight_layout()
+        sicherer_name = name.replace(":", "_").replace(", ", "_").replace(" ", "_").replace("(", "").replace(")", "")
+        pfad_kombi = os.path.join(output_ordner, f"{datei_datum}Combi_{sicherer_name}_{mode}.png")
+        plt.savefig(pfad_kombi, dpi=600, bbox_inches='tight')
+        plt.close(fig_kombi)
+# ==========================================
+# EXTREMWERTE SETUP (Global)
+# ==========================================
+summary_lines = [f"Extremwerte fuer Probe: {sample_name} und Kontrollen", "="*40]
+
+def ermittle_extrema_volt(name_str, y_daten, x_volt, xlim=None):
+    if y_daten is not None and not y_daten.dropna().empty and x_volt is not None:
+        clean_y = y_daten.dropna()
+        valid_idx = clean_y.index
+        clean_x = x_volt.loc[valid_idx]
+
+        if xlim:
+            mask = (clean_x >= xlim[0]) & (clean_x <= xlim[1])
+            clean_y = clean_y[mask]
+            clean_x = clean_x[mask]
+
+        if clean_y.empty:
+            return
+
+        summary_lines.append(f"\n--- {name_str} ---")
+
+        y_array = clean_y.values
+        signal_range = clean_y.max() - clean_y.min()
+        min_prom = signal_range * 0.05 if signal_range > 0 else 0.01
+
+        peaks, _ = find_peaks(y_array, prominence=min_prom, width=2)
+        if len(peaks) > 0:
+            summary_lines.append("Gefundene Hochpunkte (Maxima):")
+            for p in peaks:
+                max_val = y_array[p]
+                volt_max = clean_x.iloc[p]
+                summary_lines.append(f"  -> {max_val:.4f} µA/cm² (bei V = {volt_max:.4f} V)")
+        else:
+            max_val = clean_y.max()
+            volt_max = clean_x.loc[clean_y.idxmax()]
+            summary_lines.append(f"Globaler Hochpunkt: {max_val:.4f} µA/cm² (bei V = {volt_max:.4f} V)")
+
+        troughs, _ = find_peaks(-y_array, prominence=min_prom, width=2)
+        if len(troughs) > 0:
+            summary_lines.append("Gefundene Tiefpunkte (Minima):")
+            for t in troughs:
+                min_val = y_array[t]
+                volt_min = clean_x.iloc[t]
+                summary_lines.append(f"  -> {min_val:.4f} µA/cm² (bei V = {volt_min:.4f} V)")
+        else:
+            min_val = clean_y.min()
+            volt_min = clean_x.loc[clean_y.idxmin()]
+            summary_lines.append(f"Globaler Tiefpunkt: {min_val:.4f} µA/cm² (bei V = {volt_min:.4f} V)")
+
+def ermittle_extrema(name_str, daten_series, zeit_series):
+    if daten_series is not None and not daten_series.dropna().empty and zeit_series is not None:
+        clean_daten = daten_series.dropna()
+        valid_idx = clean_daten.index
+        clean_zeit = zeit_series.loc[valid_idx]
+        
+        start_val = clean_daten.iloc[0]
+        start_idx = clean_daten.index[0]
+        zeit_start = clean_zeit.loc[start_idx]
+
+        max_val = clean_daten.max()
+        max_idx = clean_daten.idxmax()
+        zeit_max = clean_zeit.loc[max_idx] if max_idx in clean_zeit.index else float('nan')
+
+        min_val = clean_daten.min()
+        min_idx = clean_daten.idxmin()
+        zeit_min = clean_zeit.loc[min_idx] if min_idx in clean_zeit.index else float('nan')
+
+        summary_lines.append(f"\n--- {name_str} ---")
+        summary_lines.append(f"Startwert:        {start_val:.4f}  (bei t = {zeit_start:.2f} h)")
+        summary_lines.append(f"Hochpunkt (Max):  {max_val:.4f}  (bei t = {zeit_max:.2f} h)")
+        summary_lines.append(f"Tiefpunkt (Min):  {min_val:.4f}  (bei t = {zeit_min:.2f} h)")
+
+# ==========================================
+# 5. DPV UND CV PRO KANAL (PRE VS POST)
+# ==========================================
+def plot_ec_comparison(daten_pre, daten_post, mapping_pre, mapping_post, title_prefix, file_prefix, ylabel='Current Density (µA/cm²)', xlabel='Potential (V)', xlim=None):
+    if daten_pre is None and daten_post is None:
+        return
+
+    for i in range(anzahl_kanale):
+        if i in kanale_ausblenden:
+            continue
+        
+        name = kanal_namen.get(i, f"Channel {i+1}")
+        
+        fig, ax = plt.subplots(figsize=(8, 6))
+        plotted = False
+        
+        c_idx_pre = mapping_pre.get(i)
+        if daten_pre is not None and c_idx_pre is not None and (c_idx_pre * 2 + 1) in daten_pre.columns:
+            col_v = c_idx_pre * 2
+            col_i = c_idx_pre * 2 + 1
+            v_pre = pd.to_numeric(daten_pre[col_v], errors='coerce')
+            i_pre = pd.to_numeric(daten_pre[col_i], errors='coerce') / flaeche_cm2
+            
+            ax.plot(v_pre, i_pre, color='black', linewidth=2, label='Pre Run')
+            plotted = True
+            
+            # NEU: Schreibt die Werte für PRE in die Textdatei!
+            ermittle_extrema_volt(f"{title_prefix} - {name} (Pre)", i_pre, v_pre, xlim)
+            
+        c_idx_post = mapping_post.get(i)
+        if daten_post is not None and c_idx_post is not None and (c_idx_post * 2 + 1) in daten_post.columns:
+            col_v = c_idx_post * 2
+            col_i = c_idx_post * 2 + 1
+            v_post = pd.to_numeric(daten_post[col_v], errors='coerce')
+            i_post = pd.to_numeric(daten_post[col_i], errors='coerce') / flaeche_cm2
+            
+            ax.plot(v_post, i_post, color='gray', linewidth=2, linestyle='--', label='Post Run')
+            plotted = True
+            
+            # NEU: Schreibt die Werte für POST in die Textdatei!
+            ermittle_extrema_volt(f"{title_prefix} - {name} (Post)", i_post, v_post, xlim)
+            
+        if plotted:
+            ax.set_xlabel(xlabel, fontsize=12)
+            ax.set_ylabel(ylabel, fontsize=12)
+            if xlim:
+                ax.set_xlim(xlim)
+                y_min_val, y_max_val_local = float('inf'), float('-inf')
+                for line in ax.get_lines():
+                    x_data = pd.Series(line.get_xdata())
+                    y_data = pd.Series(line.get_ydata())
+                    mask = (x_data >= xlim[0]) & (x_data <= xlim[1])
+                    valid_y = y_data[mask].dropna()
+                    if not valid_y.empty:
+                        y_min_val = min(y_min_val, valid_y.min())
+                        y_max_val_local = max(y_max_val_local, valid_y.max())
+                
+                if y_min_val != float('inf') and y_max_val_local != float('-inf'):
+                    padding = (y_max_val_local - y_min_val) * 0.05
+                    padding = padding if padding > 0 else 0.1
+                    ax.set_ylim(y_min_val - padding, y_max_val_local + padding)
+                    
+            ax.legend()
+            ax.grid(True, linestyle=':', alpha=0.4)
+            plt.tight_layout()
+            
+            sicherer_name = name.replace(":", "_").replace(", ", "_").replace(" ", "_").replace("(", "").replace(")", "")
+            pfad = os.path.join(output_ordner, f"{datei_datum}{file_prefix}_{sicherer_name}.png")
+            plt.savefig(pfad, dpi=600, bbox_inches='tight')
+        plt.close(fig)
+
+def ermittle_volt_range(daten_liste, mapping_liste, puffer=0.2):
+    v_min_global, v_max_global = float('inf'), float('-inf')
+    for daten, mapping in zip(daten_liste, mapping_liste):
+        if daten is None:
+            continue
+        for i in range(anzahl_kanale):
+            if i in kanale_ausblenden:
+                continue
+            c_idx = mapping.get(i)
+            if c_idx is None:
+                continue
+            col_v = c_idx * 2
+            if col_v in daten.columns:
+                v = pd.to_numeric(daten[col_v], errors='coerce').dropna()
+                if not v.empty:
+                    v_min_global = min(v_min_global, v.min())
+                    v_max_global = max(v_max_global, v.max())
+    if v_min_global == float('inf') or v_max_global == float('-inf'):
+        return None
+    return (v_min_global - puffer, v_max_global + puffer)
+
+plot_ec_comparison(daten_dpv_pre, daten_dpv_post, dpv_pre_mapping, dpv_post_mapping, 'DPV Analysis', 'DPV', xlim=(dpv_min_val, dpv_max_val))
+
+cv_xlim = ermittle_volt_range([daten_cv_pre, daten_cv_post], [cv_pre_mapping, cv_post_mapping], puffer=0.2)
+plot_ec_comparison(daten_cv_pre, daten_cv_post, cv_pre_mapping, cv_post_mapping, 'CV Analysis', 'CV', xlim=cv_xlim)
+# ==========================================
+# 6. DPV UND CV SUMMARY-GRAPHEN (MITTELWERTE)
+# ==========================================
+def plot_ec_summary(daten_pre, daten_post, mapping_pre, mapping_post, title, file_prefix, xlim=None, show_controls=True):
+    if daten_pre is None and daten_post is None:
+        return
+        
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # 1. Mittelwerte für Proben
+    for daten, mapping, label_suffix, style, color_mean in [(daten_pre, mapping_pre, 'Pre', '-', 'black'), (daten_post, mapping_post, 'Post', '--', 'grey')]:
+        if daten is not None:
+            reps_i = []
+            v_axis = None
+            for i in replikate_idx:
+                c_idx = mapping.get(i)
+                if c_idx is not None and (c_idx * 2 + 1) in daten.columns:
+                    reps_i.append(pd.to_numeric(daten[c_idx * 2 + 1], errors='coerce') / flaeche_cm2)
+                    if v_axis is None:
+                        v_axis = pd.to_numeric(daten[c_idx * 2], errors='coerce')
+            
+            if len(reps_i) > 0 and v_axis is not None:
+                mean_i = pd.concat(reps_i, axis=1).mean(axis=1)
+                ax.plot(v_axis, mean_i, color=color_mean, linewidth=3, linestyle=style, label=f'Mean {sample_name} ({label_suffix})')
+                
+                # Volt-Extrema für die Probe abgreifen (nur wenn Kontrollen gezeichnet werden, 
+                # sonst steht es doppelt in der txt-Datei)
+                if show_controls:
+                    ermittle_extrema_volt(f"{title} - Mean {sample_name} ({label_suffix})", mean_i, v_axis, xlim)
+
+    # 2. Kontrollen (werden nur gezeichnet, wenn show_controls=True)
+    if show_controls:
+        for idx, i in enumerate(kontrollen_idx):
+            if i in kanale_ausblenden: 
+                continue
+                
+            name = kanal_namen.get(i, f"Channel {i+1}")
+            farbe = kontroll_farben_map.get(i, 'red')
+            
+            c_idx_pre = mapping_pre.get(i)
+            if daten_pre is not None and c_idx_pre is not None and (c_idx_pre * 2 + 1) in daten_pre.columns:
+                col_v = c_idx_pre * 2
+                col_i = c_idx_pre * 2 + 1
+                v_pre = pd.to_numeric(daten_pre[col_v], errors='coerce')
+                i_pre = pd.to_numeric(daten_pre[col_i], errors='coerce') / flaeche_cm2
+                ax.plot(v_pre, i_pre, color=farbe, linewidth=1.5, linestyle='-', alpha=0.8, label=f'{name} (Pre)')
+                ermittle_extrema_volt(f"{title} - Control '{name}' (Pre)", i_pre, v_pre, xlim)
+                
+            c_idx_post = mapping_post.get(i)
+            if daten_post is not None and c_idx_post is not None and (c_idx_post * 2 + 1) in daten_post.columns:
+                col_v = c_idx_post * 2
+                col_i = c_idx_post * 2 + 1
+                v_post = pd.to_numeric(daten_post[col_v], errors='coerce')
+                i_post = pd.to_numeric(daten_post[col_i], errors='coerce') / flaeche_cm2
+                ax.plot(v_post, i_post, color=farbe, linewidth=1.5, linestyle=':', alpha=0.8, label=f'{name} (Post)')
+                ermittle_extrema_volt(f"{title} - Control '{name}' (Post)", i_post, v_post, xlim)
+
+    ax.set_xlabel('Potential (V)', fontsize=12)
+    ax.set_ylabel('Current Density (µA/cm²)', fontsize=12)
+    if xlim:
+        ax.set_xlim(xlim)
+        # Y-Achse dynamisch an den sichtbaren DPV-Ausschnitt anpassen
+        y_min_val, y_max_val_local = float('inf'), float('-inf')
+        for line in ax.get_lines():
+            x_data = pd.Series(line.get_xdata())
+            y_data = pd.Series(line.get_ydata())
+            mask = (x_data >= xlim[0]) & (x_data <= xlim[1])
+            valid_y = y_data[mask].dropna()
+            if not valid_y.empty:
+                y_min_val = min(y_min_val, valid_y.min())
+                y_max_val_local = max(y_max_val_local, valid_y.max())
+        
+        if y_min_val != float('inf') and y_max_val_local != float('-inf'):
+            padding = (y_max_val_local - y_min_val) * 0.05
+            padding = padding if padding > 0 else 0.1
+            ax.set_ylim(y_min_val - padding, y_max_val_local + padding)
+            
+    ax.grid(True, linestyle=':', alpha=0.4)
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+    plt.tight_layout()
+    
+    # Dateinamen dynamisch anpassen
+    suffix = "_Summary" if show_controls else "_SamplesOnly"
+    pfad = os.path.join(output_ordner, f"{datei_datum}{file_prefix}{suffix}.png")
+    plt.savefig(pfad, dpi=600, bbox_inches='tight')
+    plt.close(fig)
+
+# 1. Die klassischen Graphen (mit Kontrollen)
+plot_ec_summary(daten_dpv_pre, daten_dpv_post, dpv_pre_mapping, dpv_post_mapping, 'Summary: DPV Pre vs Post', 'DPV', xlim=(dpv_min_val, dpv_max_val))
+plot_ec_summary(daten_cv_pre, daten_cv_post, cv_pre_mapping, cv_post_mapping, 'Summary: CV Pre vs Post', 'CV', xlim=cv_xlim)
+
+# 2. Die neuen Graphen (nur die reinen Proben)
+plot_ec_summary(daten_dpv_pre, daten_dpv_post, dpv_pre_mapping, dpv_post_mapping, 'Samples Only: DPV', 'DPV', xlim=(dpv_min_val, dpv_max_val), show_controls=False)
+plot_ec_summary(daten_cv_pre, daten_cv_post, cv_pre_mapping, cv_post_mapping, 'Samples Only: CV', 'CV', xlim=cv_xlim, show_controls=False)
+# ==========================================
+# 7. DER FINALE MITTELWERT-GRAPH (CHRONO + PHOTO)
+# ==========================================
+has_fecn = False
+for i in range(anzahl_kanale):
+    if i not in kanale_ausblenden:
+        if photo_mapping_cols[i]['a_420'] is not None and photo_mapping_cols[i]['a_420'] in daten_photometer.columns:
+            has_fecn = True
+            break
+
+n_proben = len(replikate_idx)
+
+# Erstellt für jeden gewählten Modus eine komplette eigene Grafik
+for mode in gui_data['od420_modes']:
+    n_subplots = 3 if has_fecn else 2
+    fig_final, axes = plt.subplots(n_subplots, 1, figsize=(10, 4 * n_subplots), sharex=True)
+
+    if has_fecn:
+        ax1, ax2, ax3 = axes
+    else:
+        ax1, ax2 = axes
+        ax3 = None
+
+    chrono_reps, od600_reps, od420_reps = [], [], []
+
+    for i in replikate_idx:
+        c_idx = chrono_mapping.get(i)
+        if daten_chrono is not None and c_idx is not None and (c_idx * 2 + 1) in daten_chrono.columns:
+            strom_raw = pd.to_numeric(daten_chrono[c_idx * 2 + 1], errors='coerce').copy()
+            zc_h = pd.to_numeric(daten_chrono[c_idx * 2], errors='coerce') / 3600
+            if i in kanale_abgebrochen:
+                cutoff_h = kanale_abgebrochen[i]
+                strom_raw.loc[zc_h > cutoff_h] = float('nan')
+            if activate_baseline and not strom_raw.dropna().empty:
+                baseline = strom_raw.dropna().iloc[:5].mean() if len(strom_raw.dropna()) >= 5 else strom_raw.dropna().iloc[0]
+                strom_raw = strom_raw - baseline
+            strom_dichte = strom_raw / flaeche_cm2
+            chrono_reps.append(strom_dichte)
+        
+        cols = photo_mapping_cols[i]
+        if cols['a_600'] is not None and cols['a_600'] in daten_photometer.columns:
+            od600 = pd.to_numeric(daten_photometer[cols['a_600']], errors='coerce')
+            od600_reps.append(od600)
+            
+            if cols['a_420'] is not None and cols['a_420'] in daten_photometer.columns:
+                od420_raw = pd.to_numeric(daten_photometer[cols['a_420']], errors='coerce')
+                od420_korr = get_od420_corrected(od420_raw, od600, mode)
+                od420_reps.append(od420_korr)
+
+    # --- MITTELWERTE & STANDARDABWEICHUNG ---
+    if n_proben > 0:
+        chrono_df = pd.concat(chrono_reps, axis=1) if chrono_reps else None
+        od600_df = pd.concat(od600_reps, axis=1) if od600_reps else None
+        od420_df = pd.concat(od420_reps, axis=1) if od420_reps else None
+        
+        chrono_mean = chrono_df.mean(axis=1) if chrono_df is not None else None
+        chrono_std = chrono_df.std(axis=1) if chrono_df is not None else None
+        
+        od600_mean = od600_df.mean(axis=1) if od600_df is not None else None
+        od600_std = od600_df.std(axis=1) if od600_df is not None else None
+        
+        od420_mean = od420_df.mean(axis=1) if od420_df is not None else None
+        od420_std = od420_df.std(axis=1) if od420_df is not None else None
+
+        zeit_chrono_final = None 
+        if chrono_mean is not None and daten_chrono is not None:
+            chrono_mean = chrono_mean.rolling(window=glaettung_fenster, min_periods=1).median()
+            chrono_std = chrono_std.rolling(window=glaettung_fenster, min_periods=1).median()
+            erster_chrono_rep = None
+            for rep in replikate_idx:
+                if chrono_mapping.get(rep) is not None:
+                    erster_chrono_rep = rep
+                    break
+            if erster_chrono_rep is not None:
+                zeit_chrono_final = pd.to_numeric(daten_chrono[chrono_mapping[erster_chrono_rep] * 2], errors='coerce') / 3600
+                ax1.plot(zeit_chrono_final, chrono_mean, color='black', linewidth=3, label=f'Mean {sample_name} (n={n_proben})')
+                ax1.fill_between(zeit_chrono_final, chrono_mean - chrono_std, chrono_mean + chrono_std, color='black', alpha=0.2)
+
+        zeit_photo_final = None
+        for rep in replikate_idx:
+            if photo_mapping_cols[rep]['t_600'] is not None:
+                zeit_photo_final = pd.to_numeric(daten_photometer[photo_mapping_cols[rep]['t_600']], errors='coerce') / 60
+                break
+
+        if zeit_photo_final is not None:
+            if od600_mean is not None:
+                ax2.plot(zeit_photo_final, od600_mean, color='black', linewidth=3, label=f'Mean {sample_name} (n={n_proben})')
+                ax2.fill_between(zeit_photo_final, od600_mean - od600_std, od600_mean + od600_std, color='black', alpha=0.2)
+            if od420_mean is not None and ax3 is not None:
+                ax3.plot(zeit_photo_final, od420_mean, color='black', linewidth=3, label=f'Mean {sample_name} (n={n_proben})')
+                ax3.fill_between(zeit_photo_final, od420_mean - od420_std, od420_mean + od420_std, color='black', alpha=0.2)
+
+        # Extremwerte der Basis-Kanäle (Chrono & OD600) nur einmal abspeichern, OD420 pro Mode speichern
+        if mode == gui_data['od420_modes'][0]:
+            ermittle_extrema(f"Probe ({sample_name}) - Current Density (µA/cm²)", chrono_mean, zeit_chrono_final)
+            ermittle_extrema(f"Probe ({sample_name}) - OD 600 nm", od600_mean, zeit_photo_final)
+        ermittle_extrema(f"Probe ({sample_name}) - OD 420 nm ({mode})", od420_mean, zeit_photo_final)
+
+    for idx, i in enumerate(kontrollen_idx):
+        if i in kanale_ausblenden: 
+            continue
+        name = kanal_namen.get(i, f"Channel {i+1}")
+        farbe = kontroll_farben_map.get(i, 'red')
+        
+        # Chrono Kontrolle
+        c_idx = chrono_mapping.get(i)
+        if daten_chrono is not None and c_idx is not None and (c_idx * 2 + 1) in daten_chrono.columns and i != kanal_ohne_strom:
+            strom_raw = pd.to_numeric(daten_chrono[c_idx * 2 + 1], errors='coerce').copy()
+            zc = pd.to_numeric(daten_chrono[c_idx * 2], errors='coerce') / 3600
+            if i in kanale_abgebrochen:
+                cutoff_h = kanale_abgebrochen[i]
+                strom_raw.loc[zc > cutoff_h] = float('nan')
+            if activate_baseline and not strom_raw.dropna().empty:
+                baseline = strom_raw.dropna().iloc[:5].mean() if len(strom_raw.dropna()) >= 5 else strom_raw.dropna().iloc[0]
+                strom_raw = strom_raw - baseline
+            strom_eval = strom_raw / flaeche_cm2
+            strom_smoothed = strom_eval.rolling(window=glaettung_fenster, min_periods=1).median()
+            ax1.plot(zc, strom_smoothed, color=farbe, linewidth=1.5, linestyle='--', label=name)
+            if mode == gui_data['od420_modes'][0]:
+                ermittle_extrema(f"Control '{name}' - Current Density (µA/cm²)", strom_smoothed, zc)
+        
+        # Photometer Kontrolle
+        cols = photo_mapping_cols[i]
+        if cols['t_600'] is not None and cols['a_600'] in daten_photometer.columns:
+            zp = pd.to_numeric(daten_photometer[cols['t_600']], errors='coerce') / 60
+            od600 = pd.to_numeric(daten_photometer[cols['a_600']], errors='coerce')
+            ax2.plot(zp, od600, color=farbe, linewidth=1.5, linestyle='--', label=name)
+            if mode == gui_data['od420_modes'][0]:
+                ermittle_extrema(f"Control '{name}' - OD 600 nm", od600, zp)
+            
+            if cols['a_420'] is not None and cols['a_420'] in daten_photometer.columns:
+                od420_raw = pd.to_numeric(daten_photometer[cols['a_420']], errors='coerce')
+                od420_korr = get_od420_corrected(od420_raw, od600, mode)
+                if ax3 is not None:
+                    ax3.plot(zp, od420_korr, color=farbe, linewidth=1.5, linestyle='--', label=name)
+                ermittle_extrema(f"Control '{name}' - OD 420 nm ({mode})", od420_korr, zp)
+
+    ax1.set_ylabel('Current Density\n(µA/cm²)', fontsize=11)
+    ax2.set_ylabel(r'Optical Density' + '\n' + r'(OD$_{600}$)', fontsize=11)
+
+    achsen_liste = [ax1, ax2]
+    if ax3 is not None:
+        ax3.set_ylabel(get_od420_ylabel(mode), fontsize=11)
+        ax3.set_xlabel('Time [h]', fontsize=12)
+        ax3.xaxis.set_major_locator(MultipleLocator(4))
+        ax3.xaxis.set_minor_locator(MultipleLocator(1))
+        achsen_liste.append(ax3)
+    else:
+        ax2.set_xlabel('Time [h]', fontsize=12)
+        ax2.xaxis.set_major_locator(MultipleLocator(4))
+        ax2.xaxis.set_minor_locator(MultipleLocator(1))
+
+    for ax in achsen_liste:
+        ax.grid(True, linestyle=':', alpha=0.4)
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+
+    ax1.text(-0.12, 1.05, 'A', transform=ax1.transAxes, fontsize=14, fontweight='bold')
+    ax2.text(-0.12, 1.05, 'B', transform=ax2.transAxes, fontsize=14, fontweight='bold')
+    if ax3 is not None:
+        ax3.text(-0.12, 1.05, 'C', transform=ax3.transAxes, fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    pfad_final = os.path.join(output_ordner, f"{datei_datum}Summary_Means_{mode}.png")
+    plt.savefig(pfad_final, dpi=600, bbox_inches='tight')
+    plt.close(fig_final)
+
+# --- TXT SCHREIBEN ---
+pfad_txt = os.path.join(output_ordner, f"{datei_datum}{sicherer_sample_name}_Extremwerte.txt")
+with open(pfad_txt, "w", encoding="utf-8") as f:
+    f.write("\n".join(summary_lines))
+# --------------------------------------------
+
+# ==========================================
+# 8. ANZEIGEN & BEENDEN
+# ==========================================
+plt.show()  # Skript pausiert hier, bis die generierten Bild-Fenster geschlossen werden
+root.destroy() # Zerstört das versteckte Tkinter-Fenster endgültig
+sys.exit(0) # Beendet den Python-Prozess sauber

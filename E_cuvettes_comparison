@@ -1,0 +1,426 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import sys
+import tkinter as tk
+from tkinter import messagebox
+from tkinterdnd2 import TkinterDnD, DND_FILES
+from scipy.integrate import trapezoid
+from scipy.stats import ttest_ind
+
+# ==========================================
+# 1. HAUPTFENSTER & DRAG & DROP UI
+# ==========================================
+# Wir nutzen TkinterDnD.Tk() anstelle des normalen tk.Tk()
+root = TkinterDnD.Tk()
+root.title("Multisample Analyse & Statistik (Drag & Drop)")
+root.geometry("820x660")
+
+# --- Bereich 1: Drop Zone ---
+drop_frame = tk.Frame(root, height=80, bg="#e0e0e0", relief="groove", borderwidth=2)
+drop_frame.pack(fill="x", padx=15, pady=15)
+drop_frame.pack_propagate(False) # Verhindert, dass das Frame schrumpft
+
+lbl_drop = tk.Label(drop_frame, text="⬇️ CSV-Dateien hier hineinziehen (Drag & Drop) ⬇️", bg="#e0e0e0", font=('Arial', 12, 'bold'), fg="#333333")
+lbl_drop.pack(expand=True, fill="both")
+
+# --- Bereich 2: Scrollbare Dateiliste ---
+list_frame_container = tk.Frame(root)
+list_frame_container.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+canvas = tk.Canvas(list_frame_container)
+scrollbar = tk.Scrollbar(list_frame_container, orient="vertical", command=canvas.yview)
+scrollable_frame = tk.Frame(canvas)
+
+scrollable_frame.bind(
+    "<Configure>",
+    lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+)
+
+canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+canvas.configure(yscrollcommand=scrollbar.set)
+
+canvas.pack(side="left", fill="both", expand=True)
+scrollbar.pack(side="right", fill="y")
+
+# Header der Tabelle
+tk.Label(scrollable_frame, text="Dateiname", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+tk.Label(scrollable_frame, text="Proben-Name (für Legende)", font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=5, pady=5, sticky="w")
+tk.Label(scrollable_frame, text="Kanäle (z.B. 1,2,3)", font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=5, pady=5, sticky="w")
+tk.Label(scrollable_frame, text="WT-Kontrolle", font=('Arial', 10, 'bold')).grid(row=0, column=3, padx=5, pady=5, sticky="w")
+
+gui_entries = []
+row_counter = 1
+
+# Steuervariable für die Wildtyp-Auswahl (Radiobutton) ---
+# Der Wert entspricht dem 'path' der als WT markierten Probe.
+wt_selection_var = tk.StringVar(master=root, value="")
+
+# Funktion: Neue Datei zur Liste hinzufügen
+def add_file_row(filepath):
+    global row_counter
+    dateiname = os.path.basename(filepath)
+    
+    # Check, ob die Datei schon existiert (optional)
+    if any(entry['path'] == filepath for entry in gui_entries):
+        return # Überspringe Duplikate
+    
+    # Label für Dateinamen
+    lbl_file = tk.Label(scrollable_frame, text=dateiname[:25] + ("..." if len(dateiname)>25 else ""))
+    lbl_file.grid(row=row_counter, column=0, padx=5, pady=5, sticky="w")
+    
+    # Entry für Proben-Namen
+    ent_name = tk.Entry(scrollable_frame, width=25)
+    ent_name.insert(0, f"Probe {len(gui_entries)+1}")
+    ent_name.grid(row=row_counter, column=1, padx=5, pady=5)
+    
+    # Entry für Kanäle
+    ent_channels = tk.Entry(scrollable_frame, width=15)
+    ent_channels.insert(0, "1, 2, 3")
+    ent_channels.grid(row=row_counter, column=2, padx=5, pady=5)
+    
+    # --- NEU: Radiobutton zur Auswahl der WT-Kontrolle ---
+    rb_wt = tk.Radiobutton(scrollable_frame, variable=wt_selection_var, value=filepath)
+    rb_wt.grid(row=row_counter, column=3, padx=5, pady=5)
+    
+    # Erste hinzugefügte Datei automatisch als WT vorauswählen
+    if not wt_selection_var.get():
+        wt_selection_var.set(filepath)
+    
+    # Speichere Referenzen
+    entry_data = {
+        'path': filepath,
+        'ent_name': ent_name,
+        'ent_channels': ent_channels,
+        'lbl_file': lbl_file,
+        'rb_wt': rb_wt
+    }
+    gui_entries.append(entry_data)
+    row_counter += 1
+
+# Das Drag & Drop Event
+def on_drop(event):
+    # tk.splitlist löst das Problem, dass Dateipfade mit Leerzeichen in geschweifte Klammern gesetzt werden
+    files = root.tk.splitlist(event.data)
+    for f in files:
+        if f.lower().endswith('.csv'):
+            add_file_row(f)
+
+# Drop-Target registrieren
+drop_frame.drop_target_register(DND_FILES)
+drop_frame.dnd_bind('<<Drop>>', on_drop)
+
+# --- Bereich 3: Einstellungen & Start ---
+bottom_frame = tk.Frame(root)
+bottom_frame.pack(fill="x", padx=15, pady=(0, 15))
+
+baseline_var = tk.BooleanVar(master=root, value=True)
+chk_baseline = tk.Checkbutton(bottom_frame, text="Baseline-Subtraktion anwenden", variable=baseline_var, font=('Arial', 10, 'bold'))
+chk_baseline.pack(pady=5)
+
+# --- Option zum Abschneiden aller Kanäle bei bestimmter Stundenzahl ---
+cutoff_frame = tk.Frame(bottom_frame)
+cutoff_frame.pack(pady=5)
+
+cutoff_var = tk.BooleanVar(master=root, value=False)
+chk_cutoff = tk.Checkbutton(cutoff_frame, text="Alle Kanäle abschneiden bei [h]:", variable=cutoff_var, font=('Arial', 10, 'bold'))
+chk_cutoff.pack(side="left")
+
+ent_cutoff = tk.Entry(cutoff_frame, width=10)
+ent_cutoff.insert(0, "24")
+ent_cutoff.pack(side="left", padx=5)
+
+config_data = []
+activate_baseline = True
+cutoff_enabled = False
+cutoff_hours = None
+wt_control_name = None   # <-- NEU: Name der gewählten Wildtyp-Kontrolle
+
+def on_confirm():
+    global activate_baseline, cutoff_enabled, cutoff_hours, wt_control_name
+    activate_baseline = baseline_var.get()
+    cutoff_enabled = cutoff_var.get()
+    
+    if not gui_entries:
+        messagebox.showerror("Fehler", "Bitte ziehe zuerst CSV-Dateien in die Drop-Zone!")
+        return
+    
+    # --- NEU: Prüfen, ob eine WT-Kontrolle ausgewählt wurde ---
+    wt_path = wt_selection_var.get()
+    if not wt_path:
+        messagebox.showerror("Fehler", "Bitte wähle eine Probe als WT-Kontrolle aus!")
+        return
+        
+    try:
+        # Cutoff-Wert prüfen, falls aktiviert
+        if cutoff_enabled:
+            try:
+                cutoff_hours = float(ent_cutoff.get().replace(',', '.'))
+                if cutoff_hours <= 0:
+                    raise ValueError
+            except ValueError:
+                raise ValueError("Bitte eine gültige positive Stundenzahl zum Abschneiden angeben.")
+        else:
+            cutoff_hours = None
+        
+        namen_gesehen = set()
+        for entry in gui_entries:
+            path = entry['path']
+            name = entry['ent_name'].get().strip()
+            
+            if not name:
+                raise ValueError("Ein Proben-Name darf nicht leer sein.")
+            if name in namen_gesehen:
+                raise ValueError(f"Der Proben-Name '{name}' kommt mehrfach vor. Bitte eindeutige Namen vergeben.")
+            namen_gesehen.add(name)
+            
+            # Parsen der Kanäle (z.B. "1, 2, 3" -> [1, 2, 3])
+            ch_str = entry['ent_channels'].get().replace(';', ',').replace(' ', '')
+            channels = [int(c) for c in ch_str.split(',') if c.isdigit()]
+            
+            if not channels:
+                raise ValueError(f"Keine gültigen Kanäle für '{name}' angegeben.")
+                
+            config_data.append({
+                'path': path,
+                'name': name,
+                'channels': channels
+            })
+            
+            # --- NEU: Namen der WT-Kontrolle ermitteln ---
+            if path == wt_path:
+                wt_control_name = name
+        
+        if wt_control_name is None:
+            raise ValueError("Die ausgewählte WT-Kontrolle konnte nicht zugeordnet werden.")
+        
+        root.quit() # Beendet die GUI-Schleife, Code läuft weiter
+    except Exception as e:
+        messagebox.showerror("Eingabefehler", str(e))
+        config_data.clear()
+        wt_control_name = None
+
+btn_confirm = tk.Button(bottom_frame, text="Analyse & Statistik starten", command=on_confirm, bg="#198754", fg="white", font=('Arial', 10, 'bold'))
+btn_confirm.pack(pady=10)
+
+root.mainloop()
+
+# Verhindert, dass der Code nach dem Schließen mit dem "X" abstürzt, falls nichts konfiguriert wurde
+if not config_data:
+    print("Analyse abgebrochen.")
+    sys.exit()
+    
+root.destroy() # Fenster komplett schließen
+
+# ==========================================
+# 3. DATENAUSWERTUNG
+# ==========================================
+flaeche_cm2 = 0.125
+output_ordner = "Results_Multisample"
+os.makedirs(output_ordner, exist_ok=True)
+
+# Datenspeicher für Statistik
+stats_data = [] 
+
+# Plot initialisieren (Überschrift entfernt)
+fig, ax = plt.subplots(figsize=(10, 6))
+farben = plt.cm.tab10.colors 
+
+for idx, probe in enumerate(config_data):
+    try:
+        df = pd.read_csv(probe['path'], sep=',', skiprows=6, header=None, encoding='utf-16')
+    except Exception as e:
+        print(f"Fehler beim Laden von {probe['name']}: {e}")
+        continue
+        
+    # NEU: Substring-Suche für die Farbzuweisung statt exakter Abgleich
+    farbe = farben[idx % len(farben)] # Standardfarbe als Fallback
+    if 'dns' in probe['name']:
+        farbe = '#0072B2'
+    elif 'pdsA' in probe['name']:
+        farbe = '#CC79A7'
+    elif 'mtrAB' in probe['name']: # mtrAB vor mtrC prüfen, um Überschneidungen zu vermeiden
+        farbe = '#009E73'
+    elif 'mtrC' in probe['name']:
+        farbe = '#E69F00'
+    
+    zeit_arrays = []
+    stromdichte_arrays = []
+    
+    for ch in probe['channels']:
+        col_t = (ch - 1) * 2
+        col_i = (ch - 1) * 2 + 1
+        
+        if col_i in df.columns:
+            zeit_h = pd.to_numeric(df[col_t], errors='coerce') / 3600
+            strom_raw = pd.to_numeric(df[col_i], errors='coerce').copy()
+            
+            # --- Abschneiden bei bestimmter Stundenzahl (für alle Kanäle) ---
+            if cutoff_enabled and cutoff_hours is not None:
+                cutoff_maske = zeit_h <= cutoff_hours
+                zeit_h = zeit_h[cutoff_maske]
+                strom_raw = strom_raw[cutoff_maske]
+            
+            if activate_baseline and not strom_raw.dropna().empty:
+                baseline = strom_raw.dropna().iloc[:5].mean() if len(strom_raw.dropna()) >= 5 else strom_raw.dropna().iloc[0]
+                strom_raw = strom_raw - baseline
+                
+            stromdichte = strom_raw / flaeche_cm2
+            
+            # Bereinige NaN für Integrale und Max
+            gueltige_maske = stromdichte.notna() & zeit_h.notna()
+            z_clean = zeit_h[gueltige_maske]
+            s_clean = stromdichte[gueltige_maske]
+            
+            if not s_clean.empty:
+                # Statistik Werte berechnen (AUC und Max)
+                auc = trapezoid(y=s_clean, x=z_clean)
+                max_peak = s_clean.max()
+                
+                stats_data.append({
+                    'Probe': probe['name'],
+                    'Kanal': ch,
+                    'AUC': auc,
+                    'Max_Peak': max_peak
+                })
+                
+                zeit_arrays.append(zeit_h)
+                stromdichte_arrays.append(stromdichte)
+
+    if stromdichte_arrays:
+        # Mittelwert und Standardabweichung berechnen
+        df_strom = pd.concat(stromdichte_arrays, axis=1)
+        mean_strom = df_strom.mean(axis=1)
+        std_strom = df_strom.std(axis=1)
+        
+        # Plot
+        zeit_plot = zeit_arrays[0] 
+        n_replicates = len(stromdichte_arrays)
+        ax.plot(zeit_plot, mean_strom, color=farbe, linewidth=2, label=f"{probe['name']} (n={n_replicates})")
+        ax.fill_between(zeit_plot, mean_strom - std_strom, mean_strom + std_strom, color=farbe, alpha=0.2)
+
+# Graph finalisieren und speichern
+ax.set_xlim(0, 20)
+ax.set_xticks(np.arange(0, 21, 4))
+ax.set_xlabel('Time [h]', fontsize=12)
+ax.set_ylabel('Current Density (µA/cm²)', fontsize=12)
+ax.grid(True, linestyle=':', alpha=0.4)
+ax.legend(title="Strain ± SD", loc='lower right')
+plt.tight_layout()
+plt.savefig(os.path.join(output_ordner, "Multisample_Mean_SD.png"), dpi=300)
+
+# ==========================================
+# 4. SIGNIFIKANZ-STATISTIK (Mutanten vs. WT-Kontrolle + Holm-Bonferroni)
+# ==========================================
+df_stats = pd.DataFrame(stats_data)
+
+def get_sig_stars(p):
+    if pd.isna(p): return '-'
+    if p < 0.001: return '***'
+    if p < 0.01: return '**'
+    if p < 0.05: return '*'
+    return 'ns'
+
+def holm_bonferroni(p_values_dict, alpha=0.05):
+    """
+    Holm-Bonferroni step-down Korrektur.
+    Erwartet Dict {name: p_value} nur mit gültigen (float) p-Werten.
+    Gibt Dict {name: (p_value, holm_limit, signifikant_bool)} zurück.
+    """
+    sorted_tests = sorted(p_values_dict.items(), key=lambda x: x[1])
+    m = len(sorted_tests)
+    results = {}
+    for rank, (name, p_val) in enumerate(sorted_tests):
+        adjusted_alpha = alpha / (m - rank)
+        sig = p_val < adjusted_alpha
+        results[name] = (p_val, adjusted_alpha, sig)
+    return results
+
+if not df_stats.empty:
+    df_stats.to_csv(os.path.join(output_ordner, "Raw_Values_AUC_Max.csv"), index=False)
+
+    # Nur tatsächlich ausgewertete Proben verwenden (die in df_stats vorkommen)
+    verfuegbare_proben = list(df_stats['Probe'].unique())
+
+    # Sicherstellen, dass die WT-Kontrolle auswertbare Daten besitzt
+    if wt_control_name not in verfuegbare_proben:
+        print(f"\nWARNUNG: Die WT-Kontrolle '{wt_control_name}' hat keine auswertbaren Daten. "
+              f"Statistik wird übersprungen.")
+        df_results = pd.DataFrame()
+    else:
+        wt_daten = df_stats[df_stats['Probe'] == wt_control_name]
+
+        # Mutanten = alle verfügbaren Proben außer der WT-Kontrolle
+        mutanten = [p for p in verfuegbare_proben if p != wt_control_name]
+
+        # ----- Rohe p-Werte pro Metrik sammeln (nur gültige Vergleiche) -----
+        raw_p_auc = {}
+        raw_p_max = {}
+        info_zeilen = {}   # merkt sich n-Werte / Fehlermeldungen pro Mutante
+
+        for mut in mutanten:
+            mut_daten = df_stats[df_stats['Probe'] == mut]
+            n_wt = len(wt_daten)
+            n_mut = len(mut_daten)
+
+            if n_wt > 1 and n_mut > 1:
+                _, p_auc = ttest_ind(wt_daten['AUC'], mut_daten['AUC'], equal_var=False, nan_policy='omit')
+                _, p_max = ttest_ind(wt_daten['Max_Peak'], mut_daten['Max_Peak'], equal_var=False, nan_policy='omit')
+                raw_p_auc[mut] = p_auc
+                raw_p_max[mut] = p_max
+                info_zeilen[mut] = {'n_wt': n_wt, 'n_mut': n_mut, 'ok': True}
+            else:
+                info_zeilen[mut] = {'n_wt': n_wt, 'n_mut': n_mut, 'ok': False}
+
+        # ----- Holm-Bonferroni-Korrektur getrennt je Metrik -----
+        korr_auc = holm_bonferroni(raw_p_auc) if raw_p_auc else {}
+        korr_max = holm_bonferroni(raw_p_max) if raw_p_max else {}
+
+        # ----- Ergebnistabelle zusammenbauen -----
+        test_results = []
+        for mut in mutanten:
+            info = info_zeilen[mut]
+            if info['ok']:
+                p_auc, limit_auc, sig_auc = korr_auc[mut]
+                p_max, limit_max, sig_max = korr_max[mut]
+                test_results.append({
+                    'Vergleich': f"{wt_control_name} (WT) vs {mut}",
+                    'n_WT': info['n_wt'],
+                    'n_Mutante': info['n_mut'],
+                    'p-Value AUC': round(p_auc, 4),
+                    'Holm-Limit AUC': round(limit_auc, 4),
+                    'Sig AUC': get_sig_stars(p_auc) if sig_auc else 'ns',
+                    'p-Value Max Peak': round(p_max, 4),
+                    'Holm-Limit Max': round(limit_max, 4),
+                    'Sig Max Peak': get_sig_stars(p_max) if sig_max else 'ns'
+                })
+            else:
+                test_results.append({
+                    'Vergleich': f"{wt_control_name} (WT) vs {mut}",
+                    'n_WT': info['n_wt'],
+                    'n_Mutante': info['n_mut'],
+                    'p-Value AUC': 'Zu wenige Replikate (n<2)',
+                    'Holm-Limit AUC': '-',
+                    'Sig AUC': '-',
+                    'p-Value Max Peak': 'Zu wenige Replikate (n<2)',
+                    'Holm-Limit Max': '-',
+                    'Sig Max Peak': '-'
+                })
+
+        df_results = pd.DataFrame(test_results)
+        df_results.to_csv(os.path.join(output_ordner, "Significance_Tests.csv"), index=False, sep=';')
+
+    # ----- Ausgabe -----
+    print(f"\nAnalyse abgeschlossen! Dateien gespeichert in Ordner: {output_ordner}")
+    print(f"WT-Kontrolle: {wt_control_name}")
+    print("Methode: Welch's t-Test (Mutanten vs. WT-Kontrolle) mit Holm-Bonferroni-Korrektur.\n")
+    if not df_results.empty:
+        print(df_results.to_string(index=False))
+    else:
+        print("Keine statistischen Vergleiche möglich.")
+else:
+    print("\nKeine auswertbaren Daten gefunden – Statistik übersprungen.")
+
+plt.show()
+sys.exit(0)
