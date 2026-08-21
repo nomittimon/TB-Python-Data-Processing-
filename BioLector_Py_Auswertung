@@ -1,0 +1,536 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import interpolate, stats
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog, ttk
+import warnings
+
+# ==========================================
+# 0. DESIGN-VORGABEN (FARBEN & LINIEN)
+# ==========================================
+def get_plot_style(grp_name):
+    grp_lower = grp_name.lower()
+    
+    if 'dns' in grp_lower or 'wt' in grp_lower: color = '#0072B2'
+    elif 'mtrc' in grp_lower: color = '#E69F00'
+    elif 'mtrab' in grp_lower or 'mtrb' in grp_lower: color = '#009E73'
+    elif 'pdsa' in grp_lower: color = '#CC79A7'
+    else: color = '#7f7f7f'
+        
+    if 'abts' in grp_lower: linestyle = '--'
+    elif 'pms' in grp_lower: linestyle = ':'
+    elif 'pes' in grp_lower: linestyle = '-.'
+    elif 'fecn' in grp_lower: linestyle = (0, (3, 1, 1, 1))
+    else: linestyle = '-'
+        
+    return color, linestyle
+
+# ==========================================
+# 1. INTERAKTIVE DATEIAUSWAHL (Mehrere Dateien)
+# ==========================================
+root = tk.Tk()
+root.withdraw()
+
+print("Bitte wähle eine oder mehrere BioLector .xlsx Dateien aus...")
+dateien = filedialog.askopenfilenames(
+    title="Wähle BioLector Excel-Dateien aus", 
+    filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")]
+)
+
+if not dateien:
+    print("Keine Dateien ausgewählt. Abbruch.")
+    sys.exit()
+
+output_ordner = "BioLector_Auswertung"
+os.makedirs(output_ordner, exist_ok=True)
+
+# ==========================================
+# 2. DATEN EINLESEN & GRUPPEN SAMMELN
+# ==========================================
+print(f"{len(dateien)} Datei(en) ausgewählt. Lese Daten ein...")
+
+rohdaten_pro_datei = []
+alle_gruppen_set = set()
+
+for datei_pfad in dateien:
+    try:
+        df_layout = pd.read_excel(datei_pfad, sheet_name='LayoutData')
+        df_ch1 = pd.read_excel(datei_pfad, sheet_name='Channel1')
+        df_ch2 = pd.read_excel(datei_pfad, sheet_name='Channel2')
+        
+        df_layout = df_layout.dropna(subset=['Well', 'Description'])
+        df_layout['Description'] = df_layout['Description'].astype(str).str.replace(r'_x[0-9a-fA-F]{4}_?', '', regex=True).str.replace('_x000d', '', case=False).str.strip()
+        layout_dict = dict(zip(df_layout['Well'].astype(str).str.strip(), df_layout['Description']))
+        
+        for grp in layout_dict.values():
+            if grp.lower() not in ['nan', 'none', '']:
+                alle_gruppen_set.add(grp)
+                
+        rohdaten_pro_datei.append({'pfad': datei_pfad, 'layout': layout_dict, 'ch1': df_ch1, 'ch2': df_ch2})
+    except Exception as e:
+        print(f"Fehler beim Lesen von {os.path.basename(datei_pfad)}: {e}")
+
+if not rohdaten_pro_datei:
+    sys.exit("Keine gültigen Daten gefunden. Abbruch.")
+
+blank_gruppen = [g for g in alle_gruppen_set if 'blank' in g.lower()]
+experiment_gruppen = [g for g in alle_gruppen_set if g not in blank_gruppen]
+
+gruppen_datei_mapping = {}
+for datei in rohdaten_pro_datei:
+    dateiname = os.path.basename(datei['pfad'])
+    for grp in set(datei['layout'].values()):
+        if grp in experiment_gruppen:
+            if grp not in gruppen_datei_mapping: gruppen_datei_mapping[grp] = []
+            gruppen_datei_mapping[grp].append(dateiname)
+
+doppelte_gruppen = {grp: files for grp, files in gruppen_datei_mapping.items() if len(files) > 1}
+
+# ==========================================
+# 3. GUI: AUSWAHLMENÜ FÜR PARAMETER
+# ==========================================
+root_select = tk.Toplevel(root)
+root_select.title("BioLector Analyse Parameter")
+root_select.geometry("650x850")
+
+tk.Label(root_select, text="1. Welcher Channel soll ausgewertet werden?", font=("Arial", 10, "bold")).pack(pady=(15, 5))
+channel_var = tk.StringVar(value="Beide")
+frame_ch = tk.Frame(root_select)
+frame_ch.pack()
+tk.Radiobutton(frame_ch, text="Channel 1", variable=channel_var, value="Ch1").pack(side="left", padx=10)
+tk.Radiobutton(frame_ch, text="Channel 2", variable=channel_var, value="Ch2").pack(side="left", padx=10)
+tk.Radiobutton(frame_ch, text="Beide Channels", variable=channel_var, value="Beide").pack(side="left", padx=10)
+
+tk.Label(root_select, text="2. Welche Mediatoren sollen geplottet werden?", font=("Arial", 10, "bold")).pack(pady=(20, 5))
+mediatoren_verfuegbar = ["No Redox-Mediator", "FeCN", "ABTS", "PMS", "PES"]
+mediator_vars = {med: tk.BooleanVar(value=True) for med in mediatoren_verfuegbar}
+frame_med = tk.Frame(root_select)
+frame_med.pack()
+for med in mediatoren_verfuegbar:
+    tk.Checkbutton(frame_med, text=med, variable=mediator_vars[med]).pack(anchor="w")
+
+tk.Label(root_select, text="3. Gruppen sortieren, Startzeit festlegen & ausschließen:", font=("Arial", 10, "bold")).pack(pady=(20, 5))
+tk.Label(root_select, text="Nutze 'Start [h]', um Mess-Artefakte am Anfang für Plots/Kinetik/Max-Wert abzuschneiden.", fg="blue", font=("Arial", 8)).pack(pady=(0, 5))
+
+current_order_counter = 1
+group_order_dict = {grp: 999 for grp in sorted(experiment_gruppen)}
+group_vars = {grp: tk.BooleanVar(value=True) for grp in sorted(experiment_gruppen)}
+start_time_vars = {}
+order_btns = {}
+
+def set_order(grp):
+    global current_order_counter
+    if group_order_dict[grp] == 999: 
+        group_order_dict[grp] = current_order_counter
+        order_btns[grp].config(text=str(current_order_counter), bg="#a9dfbf", relief="sunken")
+        current_order_counter += 1
+
+def reset_order():
+    global current_order_counter
+    current_order_counter = 1
+    for grp in experiment_gruppen:
+        group_order_dict[grp] = 999
+        order_btns[grp].config(text="-", bg="SystemButtonFace", relief="raised")
+
+tk.Button(root_select, text="Reihenfolge zurücksetzen", command=reset_order, font=("Arial", 8)).pack(pady=(0, 10))
+
+frame_list = tk.Frame(root_select, bd=2, relief="sunken")
+frame_list.pack(fill="both", expand=True, padx=30)
+canvas = tk.Canvas(frame_list, highlightthickness=0)
+scrollbar = tk.Scrollbar(frame_list, orient="vertical", command=canvas.yview)
+scrollable_frame = tk.Frame(canvas)
+
+scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+canvas.configure(yscrollcommand=scrollbar.set)
+canvas.pack(side="left", fill="both", expand=True)
+scrollbar.pack(side="right", fill="y")
+
+def _on_mousewheel(event):
+    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+canvas.bind('<Enter>', lambda _: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+canvas.bind('<Leave>', lambda _: canvas.unbind_all("<MouseWheel>"))
+
+for grp in sorted(experiment_gruppen):
+    row = tk.Frame(scrollable_frame)
+    row.pack(fill="x", pady=2, padx=5)
+    
+    btn = tk.Button(row, text="-", width=3, command=lambda g=grp: set_order(g))
+    btn.pack(side="left", padx=(0, 10))
+    order_btns[grp] = btn
+    
+    tk.Label(row, text=grp, anchor="w", width=30).pack(side="left")
+    tk.Label(row, text="Start [h]:", fg="gray").pack(side="left", padx=(5, 2))
+    ent = tk.Entry(row, width=5, justify="center")
+    ent.insert(0, "5.0") # GEÄNDERT: Standardwert auf 5.0 gesetzt
+    ent.pack(side="left")
+    start_time_vars[grp] = ent
+    
+    chk = tk.Checkbutton(row, text="Aktiv", variable=group_vars[grp])
+    chk.pack(side="right")
+
+tk.Label(root_select, text="4. Diagramm abschneiden nach X Stunden (optional):", font=("Arial", 10, "bold")).pack(pady=(20, 5))
+cutoff_var = tk.StringVar(value="")
+tk.Entry(root_select, textvariable=cutoff_var, width=10, justify="center").pack()
+
+duplicate_vars = {}
+if doppelte_gruppen:
+    tk.Label(root_select, text="5. Konflikte bei doppelten Gruppen auflösen:", font=("Arial", 10, "bold"), fg="darkred").pack(pady=(20, 5))
+    frame_dup = tk.Frame(root_select)
+    frame_dup.pack(fill="x", padx=40)
+    for grp, files in doppelte_gruppen.items():
+        frame_row = tk.Frame(frame_dup)
+        frame_row.pack(fill="x", pady=2)
+        tk.Label(frame_row, text=f"'{grp}':").pack(side="left")
+        var = tk.StringVar(value="Alle zusammenfassen")
+        cb = ttk.Combobox(frame_row, textvariable=var, values=["Alle zusammenfassen"] + [f"Nur {f}" for f in files], state="readonly", width=35)
+        cb.pack(side="right")
+        duplicate_vars[grp] = var
+
+gewaehlte_channels, gewaehlte_mediatoren, aktive_gruppen = [], [], []
+user_cutoff_time, group_start_times, gewaehlte_duplikate_aufloesung = None, {}, {}
+
+def bestaetigen():
+    global gewaehlte_channels, gewaehlte_mediatoren, aktive_gruppen, user_cutoff_time, group_start_times, gewaehlte_duplikate_aufloesung
+    ch = channel_var.get()
+    gewaehlte_channels = ["Ch1", "Ch2"] if ch == "Beide" else [ch]
+    gewaehlte_mediatoren = [med for med, var in mediator_vars.items() if var.get()]
+    
+    def gruppen_sort_key(grp):
+        manual = group_order_dict[grp]
+        grp_lower = grp.lower()
+        has_med = 1 if any(m in grp_lower for m in ["fecn", "abts", "pms", "pes"]) else 0
+        if 'dns' in grp_lower or 'wt' in grp_lower: gen = 1
+        elif 'pdsa' in grp_lower: gen = 2
+        elif 'mtrc' in grp_lower: gen = 3
+        elif 'mtrab' in grp_lower or 'mtrb' in grp_lower: gen = 4
+        else: gen = 5
+        return (manual, has_med, gen, grp)
+        
+    aktive_gruppen = sorted([grp for grp in experiment_gruppen if group_vars[grp].get()], key=gruppen_sort_key)
+    
+    for grp in aktive_gruppen:
+        try: group_start_times[grp] = float(start_time_vars[grp].get().strip().replace(',', '.'))
+        except: group_start_times[grp] = 5.0
+            
+    try: user_cutoff_time = float(cutoff_var.get().strip().replace(',', '.'))
+    except: user_cutoff_time = None
+        
+    for grp, var in duplicate_vars.items(): gewaehlte_duplikate_aufloesung[grp] = var.get()
+    root_select.destroy()
+
+tk.Button(root_select, text="Auswertung starten", command=bestaetigen, font=("Arial", 10, "bold"), bg="#d3d3d3").pack(pady=20)
+root.wait_window(root_select)
+
+gruppen_nach_mediator = {"No Redox-Mediator": [], "FeCN": [], "ABTS": [], "PMS": [], "PES": []}
+for grp in aktive_gruppen:
+    zugeordnet = False
+    for med in ["FeCN", "ABTS", "PMS", "PES"]:
+        if med in grp:
+            gruppen_nach_mediator[med].append(grp)
+            zugeordnet = True
+            break
+    if not zugeordnet: gruppen_nach_mediator["No Redox-Mediator"].append(grp)
+
+# ==========================================
+# 4. DATEN VORBEREITEN (Roh & Gekappt)
+# ==========================================
+print("Harmonisiere Zeitachsen und wende Baseline-Korrektur an...")
+
+for datei in rohdaten_pro_datei:
+    for ch_key in ['ch1', 'ch2']:
+        df = datei[ch_key].copy()
+        df['Time[h]'] = pd.to_numeric(df['Time[h]'], errors='coerce')
+        df = df.dropna(subset=['Time[h]'])
+        for col in df.columns:
+            if col != 'Time[h]': df[col] = pd.to_numeric(df[col], errors='coerce')
+        datei[ch_key] = df
+
+max_time = max([d['ch1']['Time[h]'].max() for d in rohdaten_pro_datei])
+if user_cutoff_time and user_cutoff_time > 0: max_time = min(max_time, user_cutoff_time)
+
+common_time = np.arange(0, max_time, 0.1)
+
+master_data_raw = {"Ch1": {g: [] for g in aktive_gruppen}, "Ch2": {g: [] for g in aktive_gruppen}}
+master_data_plot = {"Ch1": {g: [] for g in aktive_gruppen}, "Ch2": {g: [] for g in aktive_gruppen}}
+
+for datei in rohdaten_pro_datei:
+    layout, dateiname = datei['layout'], os.path.basename(datei['pfad'])
+    for ch_name, df_ch in [("Ch1", datei['ch1']), ("Ch2", datei['ch2'])]:
+        if ch_name not in gewaehlte_channels: continue
+        zeit = df_ch['Time[h]'].values
+        
+        for well, grp in layout.items():
+            if grp in aktive_gruppen:
+                if grp in gewaehlte_duplikate_aufloesung and gewaehlte_duplikate_aufloesung[grp] != "Alle zusammenfassen":
+                    if dateiname != gewaehlte_duplikate_aufloesung[grp].replace("Nur ", ""): continue 
+                
+                spalte = next((col for col in df_ch.columns if well in col), None)
+                if not spalte: continue
+                
+                roh_werte = df_ch[spalte].values
+                
+                f_interp = interpolate.interp1d(zeit, roh_werte, bounds_error=False, fill_value=np.nan)
+                interpolierte_werte = f_interp(common_time)
+                
+                t_start = group_start_times[grp]
+                
+                baseline_mask = (common_time >= t_start) & (common_time <= t_start + 0.5)
+                if np.any(baseline_mask) and not np.all(np.isnan(interpolierte_werte[baseline_mask])):
+                    baseline_val = np.nanmean(interpolierte_werte[baseline_mask])
+                else:
+                    baseline_val = 0
+                
+                interpolierte_werte = interpolierte_werte - baseline_val
+                
+                master_data_raw[ch_name][grp].append(interpolierte_werte)
+                
+                masked_werte = np.copy(interpolierte_werte)
+                masked_werte[common_time < t_start] = np.nan
+                master_data_plot[ch_name][grp].append(masked_werte)
+
+# ==========================================
+# 5. KINETIK FUNKTION & STATISTIK HELPER
+# ==========================================
+def berechne_kinetik_empfehlung(zeit_series, od_series, window_size=7): 
+    od_smooth = od_series.rolling(window=3, center=True, min_periods=1).mean()
+    if od_smooth.isna().all(): return None, None
+    max_od = od_smooth.max()
+    basis_od_linear = max(0.005, od_smooth.dropna().iloc[:5].mean()) 
+    y_0_log = np.log(basis_od_linear)
+    
+    mask = (od_smooth >= max(0.05, basis_od_linear + 0.04)) & (od_smooth <= max_od * 0.75)
+    if mask.sum() < window_size:
+        mask = od_smooth > (basis_od_linear + 0.02)
+        if mask.sum() < window_size: return None, None
+            
+    t, y = zeit_series[mask].values, od_smooth[mask].values
+    ln_y = np.log(np.maximum(y, 1e-6))
+    
+    mu_max, best_intercept = 0, 0
+    for i in range(len(t) - window_size + 1):
+        slope, intercept, r, _, _ = stats.linregress(t[i:i+window_size], ln_y[i:i+window_size])
+        if slope > mu_max and r**2 > 0.95 and y[i+window_size-1] > y[i] * 1.20:
+            mu_max, best_intercept = slope, intercept
+            
+    if mu_max == 0:
+        for i in range(len(t) - window_size + 1):
+            slope, intercept, r, _, _ = stats.linregress(t[i:i+window_size], ln_y[i:i+window_size])
+            if slope > mu_max and r**2 > 0.85 and y[i+window_size-1] > y[i] * 1.15:
+                mu_max, best_intercept = slope, intercept
+
+    if mu_max <= 0: return None, None
+    return max(0, (y_0_log - best_intercept) / mu_max), np.log(2) / mu_max
+
+def holm_bonferroni(p_values_dict, alpha=0.05):
+    sorted_tests = sorted(p_values_dict.items(), key=lambda x: x[1])
+    return {name: (p_val, alpha / (len(sorted_tests) - rank), "Signifikant *" if p_val < (alpha / (len(sorted_tests) - rank)) else "n.s.") for rank, (name, p_val) in enumerate(sorted_tests)}
+
+def get_sync_auc(grp_name, t_sync, ch_name):
+    aucs = []
+    mask = common_time >= t_sync
+    # GEÄNDERT: Greift jetzt auf die maskierten Plot-Daten zu
+    for arr in master_data_plot[ch_name][grp_name]:
+        valid = ~np.isnan(arr) & mask
+        if np.any(valid): aucs.append(np.trapezoid(arr[valid], common_time[valid]))
+    return aucs
+
+# ==========================================
+# 6. PLOTTING FUNKTIONEN (Ohne Titel, V2-Layout)
+# ==========================================
+# Dynamische Ermittlung des kleinsten Startwerts für die X-Achse
+min_start_time = min(group_start_times.values()) if group_start_times else 5.0
+
+def format_axis(plt_obj, min_x, max_x):
+    plt_obj.xlabel('Time [h]', fontsize=12)
+    plt_obj.ylabel('Backscatter (a.u.)', fontsize=12)
+    plt_obj.xlim(min_x, max_x)
+    plt_obj.xticks(np.arange(np.floor(min_x), np.ceil(max_x) + 0.1, 2.5))
+    plt_obj.grid(True, linestyle=':', alpha=0.4)
+
+def format_group_name(grp):
+    if not grp.startswith("Vnat_"):
+        return grp
+    
+    parts = grp.split("_")
+    
+    # Zur Sicherheit, falls WT vorkommt (kein Delta)
+    if "wt" in grp.lower():
+        if len(parts) >= 3:
+            return rf"$\mathit{{V.\ natriegens}}$ {parts[1]} WT"
+        return rf"$\mathit{{V.\ natriegens}}$ WT"
+        
+    # Für Mutanten (z.B. Vnat_FeCN_MtrC -> V. natriegens FeCN ΔmtrC)
+    if len(parts) >= 3:
+        mediator = parts[1]
+        gen = "_".join(parts[2:])
+        # Großes Mtr zu kleinem mtr korrigieren
+        gen = gen.replace("Mtr", "mtr")
+        return rf"$\mathit{{V.\ natriegens}}$ $\Delta\mathit{{{gen}}}$ {mediator}"
+    
+    # Für Mutanten ohne Mediator (z.B. Vnat_MtrAB -> V. natriegens ΔmtrAB)
+    elif len(parts) == 2:
+        gen = parts[1]
+        # Großes Mtr zu kleinem mtr korrigieren
+        gen = gen.replace("Mtr", "mtr")
+        return rf"$\mathit{{V.\ natriegens}}$ $\Delta\mathit{{{gen}}}$"
+        
+    return grp
+
+
+for ch in gewaehlte_channels:
+    for med in gewaehlte_mediatoren:
+        gruppen = gruppen_nach_mediator[med]
+        if not gruppen: continue 
+        
+        hat_daten = False
+        plt.figure(figsize=(10, 6))
+        for grp in gruppen:
+            well_arrays = master_data_plot[ch][grp]
+            if not well_arrays: continue
+            c, ls = get_plot_style(grp)
+            for i, arr in enumerate(well_arrays):
+                # GEÄNDERT: Label wird formatiert
+                angezeigter_name = format_group_name(grp)
+                plt.plot(common_time, arr, color=c, linestyle=ls, linewidth=1.5, alpha=0.7, label=angezeigter_name if i==0 else "")
+                hat_daten = True
+                
+        if hat_daten:
+            format_axis(plt, min_start_time, np.ceil(max_time))
+            plt.legend(title="Mutants", loc='lower right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_ordner, f"{ch}_Single_Wells_{med.replace(' ', '_')}.png"), dpi=600, bbox_inches='tight')
+        plt.close()
+
+for ch in gewaehlte_channels:
+    plt.figure(figsize=(10, 6))
+    hat_daten = False
+    
+    for grp in aktive_gruppen:
+        grp_med = next((m for m in ["FeCN", "ABTS", "PMS", "PES"] if m in grp), "No Redox-Mediator")
+        if grp_med not in gewaehlte_mediatoren: continue
+            
+        well_arrays = master_data_plot[ch][grp]
+        if not well_arrays: continue
+        
+        c, ls = get_plot_style(grp)
+        stacked = np.vstack(well_arrays)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_vals = np.nanmean(stacked, axis=0)
+            std_vals = np.nanstd(stacked, axis=0)
+        
+        # GEÄNDERT: Label wird formatiert
+        angezeigter_name = format_group_name(grp)
+        plt.plot(common_time, mean_vals, color=c, linestyle=ls, linewidth=2.5, label=f"{angezeigter_name} (n={len(well_arrays)})")
+        plt.fill_between(common_time, mean_vals - std_vals, mean_vals + std_vals, color=c, alpha=0.15)
+        hat_daten = True
+
+    if hat_daten:
+        format_axis(plt, min_start_time, np.ceil(max_time))
+        plt.legend(
+    title="Mean ± SD",
+    loc="lower center",
+    bbox_to_anchor=(0.5, 1.02),
+    ncol=3,
+    frameon=False
+)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_ordner, f"{ch}_Gesamt_Mittelwerte_{'_'.join([m.replace(' ', '_') for m in gewaehlte_mediatoren])}.png"), dpi=600, bbox_inches='tight')
+    plt.close()
+
+# ==========================================
+# 7. STATISTIK & KINETIK EXPORT 
+# ==========================================
+print("\nBerechne Kinetiken und Statistiken...")
+for ch in gewaehlte_channels:
+    pfad_statistik = os.path.join(output_ordner, f"{ch}_Statistik_T_Tests.txt")
+    daten_max = {}
+    
+    with open(pfad_statistik, "w", encoding='utf-8') as f:
+        f.write(f"=== KINETISCHE WACHSTUMSPARAMETER ({ch}) ===\n")
+        f.write("Hinweis: Max Signal, Kinetik und AUC nutzen streng nur den gültigen Bereich (ab der gewählten Startzeit). Artefakte davor sind ausgeschlossen.\n\n")
+        f.write(f"{'Gruppe':<35} | {'Max Signal':<10} | {'Zeit (Max)':<12} | {'Lag-Phase':<12} | {'Doubling Time':<15} | {'AUC':<10}\n")
+        f.write("-" * 105 + "\n")
+        
+        for grp in aktive_gruppen:
+            if not master_data_raw[ch][grp]: continue
+            
+            # GEÄNDERT: AUC nutzt master_data_plot (Werte vor t_start sind NaN und werden nicht integriert)
+            daten_max[grp] = [np.nanmax(arr) for arr in master_data_plot[ch][grp] if np.any(~np.isnan(arr))]
+            grp_auc = [np.trapezoid(arr[~np.isnan(arr)], common_time[~np.isnan(arr)]) for arr in master_data_plot[ch][grp] if np.any(~np.isnan(arr))]
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                mean_vals = np.nanmean(np.vstack(master_data_plot[ch][grp]), axis=0)
+            
+            if np.all(np.isnan(mean_vals)): continue
+                
+            max_idx = np.nanargmax(mean_vals[common_time >= 1.0]) if np.any(common_time >= 1.0) else np.nanargmax(mean_vals)
+            max_t = common_time[common_time >= 1.0][max_idx] if np.any(common_time >= 1.0) else common_time[max_idx]
+            
+            valid_idx = ~np.isnan(mean_vals)
+            lag, td = berechne_kinetik_empfehlung(pd.Series(common_time[valid_idx]), pd.Series(mean_vals[valid_idx]))
+            
+            max_val_anzeige = np.mean(daten_max[grp]) if daten_max[grp] else 0.0
+            
+            f.write(f"{grp:<35} | {max_val_anzeige:<10.3f} | {f'{max_t:.2f} h':<12} | {f'{lag:.2f} h' if lag else 'N/A':<12} | {f'{td:.2f} h' if td else 'N/A':<15} | {np.mean(grp_auc) if grp_auc else 0:<10.2f}\n")
+            
+        f.write("\n\n")
+
+        # --- STATISTIK ---
+        for test_type, title, is_corrected in [
+            ("inner", "I: MUTANTEN VS. KONTROLLE (Holm-Bonferroni korrigiert)", True),
+            ("cross", "II: EINFLUSS DES MEDIATORS PRO STAMM (unkorrigiert)", False)
+        ]:
+            f.write(f"=== STATISTISCHE AUSWERTUNG {title} ===\n\n")
+            
+            for metrik_name in ["End-Yield (Max Signal)", "Fläche unter der Kurve (AUC)"]:
+                f.write(f"--- PARAMETER: {metrik_name} ---\n")
+                
+                for med in (gruppen_nach_mediator.keys() if test_type == "inner" else ["FeCN", "ABTS", "PMS", "PES"]):
+                    gruppen = gruppen_nach_mediator[med]
+                    if not gruppen: continue
+                    
+                    if test_type == "inner":
+                        cond_control = next((g for g in gruppen if 'dns' in g.lower() or 'wt' in g.lower()), None)
+                        if not cond_control or cond_control not in daten_max: continue
+                        f.write(f"\n*) Bedingung: {med} (Vergleich vs. Kontrolle: {cond_control})\n")
+                        targets = [(cond_control, g) for g in gruppen if g != cond_control]
+                    else:
+                        f.write(f"\n*) Einfluss von {med} auf die jeweiligen Stämme\n")
+                        targets = []
+                        for med_grp in gruppen:
+                            base_search = med_grp.replace(med, "").replace("__", "_").strip("_")
+                            base_grp = next((g for g in gruppen_nach_mediator["No Redox-Mediator"] if base_search.lower() in g.lower() or g.lower() in base_search.lower()), None)
+                            if base_grp: targets.append((base_grp, med_grp))
+                    
+                    raw_p_values, gefunden = {}, False
+                    for control, mutant in targets:
+                        if control in daten_max and mutant in daten_max and len(daten_max[control]) > 1 and len(daten_max[mutant]) > 1:
+                            
+                            if metrik_name == "End-Yield (Max Signal)":
+                                val_ctrl, val_mut = daten_max[control], daten_max[mutant]
+                            else:
+                                t_sync = max(group_start_times[control], group_start_times[mutant])
+                                val_ctrl = get_sync_auc(control, t_sync, ch)
+                                val_mut = get_sync_auc(mutant, t_sync, ch)
+                                
+                            if len(val_ctrl) > 1 and len(val_mut) > 1:
+                                _, p_val = stats.ttest_ind(val_ctrl, val_mut, equal_var=False, nan_policy='omit')
+                                raw_p_values[mutant if test_type == "inner" else f"{control} vs. {mutant}"] = (p_val, control, mutant)
+                                gefunden = True
+                    
+                    if not gefunden: f.write("  Keine Vergleiche möglich.\n")
+                    elif test_type == "inner":
+                        for mutante, (p, adj, sig) in holm_bonferroni({k: v[0] for k, v in raw_p_values.items()}).items():
+                            f.write(f"  {cond_control} vs. {mutante:<30}: p-Wert = {p:.4f} (Holm-Limit: {adj:.4f}) -> {sig}\n")
+                    else:
+                        for name, (p_val, ctrl, mut) in raw_p_values.items():
+                            f.write(f"  {name:<45}: p-Wert = {p_val:.4f} -> {'Signifikant *' if p_val < 0.05 else 'n.s.'}\n")
+                f.write("\n" + "="*60 + "\n\n")
+
+print(f"\nFertig! Alle Graphen und Statistik-Dateien wurden im Ordner '{output_ordner}' gespeichert.")
